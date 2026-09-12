@@ -1,0 +1,4 @@
+#!/bin/bash
+set -euo pipefail
+if [ "${3:-/}" != / ]; then exit 1; fi
+bash '/Library/Application Support/Audio8DJ/manage.sh' activate

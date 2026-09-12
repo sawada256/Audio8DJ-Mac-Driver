@@ -1,0 +1,13 @@
+# Generated locally; publish archives through GitHub Releases.
+/build/
+/dist/
+.DS_Store
+**/xcuserdata/
+/tests/pack_test
+/tests/midi_test
+/tests/lifecycle_test
+/tests/usb_lifecycle_test
+__pycache__/
+
+/tests/audio_ring_test
+/tests/midi_transport_test

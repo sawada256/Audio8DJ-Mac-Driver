@@ -1,0 +1,1516 @@
+// usb_engine.c — isochronous streaming for the Audio 8 DJ, run inside coreaudiod.
+//
+// Wire format:
+//   32 bytes = one sample frame = two 16-byte blocks
+//   block = [4 check bytes][3 byte-planes of 4 streams each]
+//   stream s has its sample at [4+s], [8+s], [12+s], most significant first
+//   check(s, blk)   = (s << 1) | (~blk & 1)
+//   channel(s, blk) = s * 2 + (~blk & 1)
+
+#include "usb_engine.h"
+#include "midi.h"
+#include "audio_ring.h"
+#include "status_file.h"
+#ifndef A8DJ_STATUS_OPEN
+#define A8DJ_STATUS_OPEN A8DJ_OpenStatusFile
+#endif
+#include <math.h>
+#include <limits.h>
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/IOCFPlugIn.h>
+#include <IOKit/usb/IOUSBLib.h>
+#include <mach/mach_time.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdatomic.h>
+
+#include "../firmware/audio8dj_firmware.h"
+
+#define NI_VID          0x17CC
+#define PID_RUN         0x1978
+#define BCD_UPLOADED    0x0018
+#define FX2_CPUCS       0xE600
+#define FX2_REQ_FWLOAD  0xA0
+
+#define EP1_BULK_OUT    0x01
+#define EP1_BULK_IN     0x81
+#define EP_ISO_IN       0x82
+#define EP_ISO_OUT      0x06
+
+#define EP1_CMD_GET_DEVICE_INFO  1
+#define EP1_CMD_MIDI_READ        6
+#define EP1_CMD_MIDI_WRITE       7
+#define EP1_CMD_AUDIO_PARAMS     9
+#define DEPTH_24                 2
+
+#define WIRE_FRAME_BYTES  32
+#define WIRE_STREAMS       4
+#define WIRE_BLOCKS        2
+
+#define ISO_MAXPKT     512
+// The queue depth is the dominant term in output latency: the engine reads the
+// playback ring NBUF transfers ahead of what the device is playing.
+//
+// Queue depth is configurable through LoadConfig; see docs/development.md.
+#define XFER_UFRAMES_MAX 32
+#define NBUF_MAX          4
+
+static int gUframes = 16;              // microframes per transfer
+static int gNbuf    = 4;               // transfers in flight per direction
+
+#define XFER_UFRAMES    gUframes
+#define XFER_FRAMES     (gUframes / 8)
+#define NBUF            gNbuf
+
+// Most sample frames that can land in one microframe, at the highest rate the
+// device offers (96 kHz -> 12, plus one for the fractional carry, plus one for
+// a lengthened microframe from the drift loop). SubmitOut builds a stack array
+// of this many frames, so raising the advertised rates without raising this
+// would overflow it -- 192 kHz alone needs 26.
+#define OUT_MAX_UFRAME_FRAMES 16
+#define A8DJ_MAX_RATE (8000 * (OUT_MAX_UFRAME_FRAMES - 2))
+
+// Power of two so ring indexing is a mask. 32768 frames is ~0.68 s at 48 kHz.
+#define RING_FRAMES   32768
+#define RING_MASK     (RING_FRAMES - 1)
+
+#define NCHUNKS (sizeof(audio8dj_firmware) / sizeof(audio8dj_firmware[0]))
+
+typedef IOUSBDeviceInterface       **DevIf;
+typedef IOUSBInterfaceInterface182 **IfIf;
+
+typedef struct {
+    int idx;
+    int isInput;
+    int pending; // owned by the USB run-loop thread
+} XferRef;
+
+static struct {
+    DevIf   dev;
+    IfIf    intf;
+    UInt8   pipeIsoIn, pipeIsoOut, pipeBulkOut, pipeBulkIn;
+
+    pthread_t     thread;
+    int           threadValid;  // thread was created and not yet joined
+    CFRunLoopRef  runLoop;
+    _Atomic int   running;
+    _Atomic int   started;      // set once the thread has finished setting up
+    int           cancelStart; // protected by startMutex
+    int           startResult;
+    pthread_mutex_t startMutex;
+    pthread_cond_t  startCond;
+
+    pthread_t     monThread;    // publishes the status file off the RT thread
+    int           monValid;
+
+    uint8_t         midiRx[512];   // must be at least the pipe's maxPacketSize
+    _Atomic int     midiPosted;
+    pthread_mutex_t ep1Mutex;      // EP1 OUT is shared with AUDIO_PARAMS
+    _Atomic unsigned midiIn, midiOut;
+    _Atomic unsigned midiPkts, midiAcks;   // EP1 IN completions / MIDI_WRITE ACKs
+    // Device -> host staging. Written by the EP1 completion on the streaming
+    // thread, drained by the MIDI thread. Single producer, single consumer.
+    uint8_t         midiRing[4096];
+    _Atomic unsigned midiHead, midiTail;
+    _Atomic unsigned midiLost;
+
+    int           buffersQuarantined; // undrained DMA buffers must never be reused
+    int           inited;       // one-time setup done
+    pthread_t     prepThread;   // uploads the firmware ahead of first use
+    int           prepValid;    // prepThread created and not yet joined
+    _Atomic int   prepBusy;     // prepThread still running
+    _Atomic int   prepDone;     // a prepare pass has completed
+
+    _Atomic int rate;
+    uint64_t uframeCursor;
+
+    uint8_t        *inBuf[NBUF_MAX],  *outBuf[NBUF_MAX];
+    IOUSBIsocFrame *inList[NBUF_MAX], *outList[NBUF_MAX];
+    XferRef         inRef[NBUF_MAX],   outRef[NBUF_MAX];
+    UInt64          nextIn, nextOut;
+    _Atomic int     inflight;
+
+    Float32 *capture;    // device -> host
+    Float32 *playback;   // host -> device
+    A8DJ_RingSlot *captureSlots, *playbackSlots;
+    int buffersReady;
+
+    _Atomic uint64_t  clockSequence; // even = coherent clock publication
+    _Atomic uint64_t  clockSeed;         // bumped per session; CoreAudio uses it
+                                         // to notice the timeline restarted
+    _Atomic uint64_t  deviceFrames;      // frames clocked in from the device
+    _Atomic uint64_t  deviceHostTime;    // mach_absolute_time at that count
+    _Atomic uint64_t  outFrames;         // frames handed to the OUT pipe
+    uint64_t          outBytePos;        // position in the continuous block stream
+
+    // Instrumentation: peaks tell us whether we are reading the part of the
+    // playback ring CoreAudio actually wrote.
+    _Atomic float lastOutPeak, lastInPeak;
+    uint32_t leadFrames;                 // how far ahead of the device we read
+    _Atomic unsigned resyncs;                    // transfers rescheduled after falling behind
+    _Atomic unsigned submitFails;                // transfers that could not be rescheduled
+    _Atomic unsigned rearms;                     // whole-chain restarts
+    _Atomic long lastDriftErr;
+    double   driftAvg;                   // smoothed outFrames - deviceFrames - lead
+    int      driftPrimed;
+    _Atomic unsigned driftFix;                   // microframes lengthened or shortened
+    _Atomic uint64_t lastWriteFrame;             // where CoreAudio last wrote
+    _Atomic uint64_t lastWriteEnd;               // one past the last frame it wrote
+
+    // Pop-noise accounting. A click has exactly three possible origins and
+    // these separate them:
+    //   xferErr/frErr/shortIn  the bus or the device did not deliver
+    //   outStarve/outMargin    we sent the device ring contents CoreAudio had
+    //                          not written yet, i.e. our own scheduling
+    //   all zero               the glitch is analog, downstream of the data
+    _Atomic unsigned xferErrIn, xferErrOut;      // completions that failed outright
+    _Atomic unsigned frErrIn, frErrOut;          // microframes with a non-zero frStatus
+    _Atomic unsigned shortIn;                    // microframes the device left empty
+    _Atomic unsigned outStarve;                  // output read ahead of CoreAudio
+    _Atomic unsigned startStarve;                // same, but in the first second
+    _Atomic long outMarginMin;               // closest approach, in frames
+    _Atomic unsigned inStarve;                   // capture read ahead of the device
+    _Atomic long inMarginMin;                // closest approach, in frames
+    _Atomic unsigned inGap;                      // capture frames never filled
+    unsigned publishTick;
+
+    char status[64];
+} g;
+
+static void PublishClock(uint64_t frames, uint64_t hostTime, int newSession)
+{
+    atomic_fetch_add(&g.clockSequence, 1);
+    if (newSession) atomic_fetch_add(&g.clockSeed, 1);
+    atomic_store(&g.deviceFrames, frames);
+    atomic_store(&g.deviceHostTime, hostTime);
+    atomic_fetch_add(&g.clockSequence, 1);
+}
+
+static pthread_mutex_t gStatusMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gStatusFileMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void SetStatus(const char *fmt, ...)
+{
+    char value[sizeof(g.status)] = {0};
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(value, sizeof(value), fmt, ap);
+    va_end(ap);
+    pthread_mutex_lock(&gStatusMutex);
+    memcpy(g.status, value, sizeof(value));
+    pthread_mutex_unlock(&gStatusMutex);
+}
+
+const char *A8DJ_UsbStatus(void)
+{
+    static _Thread_local char value[sizeof(g.status)];
+    pthread_mutex_lock(&gStatusMutex);
+    memcpy(value, g.status, sizeof(value));
+    pthread_mutex_unlock(&gStatusMutex);
+    return value[0] ? value : "idle";
+}
+
+// One transfer covers XFER_UFRAMES microframes; NBUF of them are always queued,
+// so the OUT read pointer runs that far ahead of what the device has played.
+uint32_t A8DJ_UsbTransferFrames(double inRate)
+{
+    return (uint32_t)(XFER_UFRAMES * (inRate / 8000.0));
+}
+
+uint32_t A8DJ_UsbOutputLeadFrames(double inRate)
+{
+    return NBUF * A8DJ_UsbTransferFrames(inRate);
+}
+
+static int64_t FrameDistance(uint64_t a, uint64_t b)
+{
+    if (a >= b) return a - b > INT64_MAX ? INT64_MAX : (int64_t)(a - b);
+    return b - a > INT64_MAX ? -INT64_MAX : -(int64_t)(b - a);
+}
+
+// The device name is cached by CoreAudio, so it cannot report live state.
+static void PublishStatus(void)
+{
+    pthread_mutex_lock(&gStatusFileMutex);
+    FILE *f = A8DJ_STATUS_OPEN("/tmp/a8dj-status.txt");
+    if (!f) { pthread_mutex_unlock(&gStatusFileMutex); return; }
+    fprintf(f,
+            "%s rate=%d\n"
+            "deviceFrames = %llu   (isoc IN 到着数 = 公開クロック)\n"
+            "outFrames    = %llu   (OUT 読み出し位置)\n"
+            "lastWrite    = %llu   (CoreAudio が最後に書いた位置)\n"
+            "out-read - device = %lld フレーム\n"
+            "CoreAudio書込 - out-read = %lld フレーム\n"
+            "capture peak = %.4f\n"
+            "playback peak(読めた値) = %.4f\n"
+            "drift 補正誤差 = %ld フレーム\n"
+            "resync=%u submitFail=%u rearm=%u\n"
+            "USB: 転送失敗 in=%u out=%u  µframe異常 in=%u out=%u  空 in=%u  端数 in=%u\n"
+            "出力枯渇=%u 回(起動時 %u)  最小余裕=%ld フレーム  クロック補正=%u 回\n"
+            "録音先読み=%u 回  最小余裕=%ld フレーム\n"
+            "MIDI in=%u バイト out=%u バイト  EP1受信=%u パケット(ACK %u) 読み出し%s 取りこぼし%u\n"
+            "MIDI ポート: %s\n",
+            A8DJ_UsbStatus(), g.rate,
+            (unsigned long long)g.deviceFrames,
+            (unsigned long long)g.outFrames,
+            (unsigned long long)g.lastWriteFrame,
+            (long long)FrameDistance(g.outFrames, g.deviceFrames),
+            (long long)FrameDistance(g.lastWriteFrame, g.outFrames),
+            g.lastInPeak, g.lastOutPeak, g.lastDriftErr,
+            g.resyncs, g.submitFails, g.rearms,
+            g.xferErrIn, g.xferErrOut, g.frErrIn, g.frErrOut, g.shortIn, g.inGap,
+            g.outStarve, g.startStarve, g.outMarginMin, g.driftFix,
+            g.inStarve, g.inMarginMin,
+            g.midiIn, g.midiOut,
+            g.midiPkts, g.midiAcks, g.midiPosted ? "あり" : "なし", g.midiLost,
+            A8DJ_MidiStatus());
+    fclose(f);
+    pthread_mutex_unlock(&gStatusFileMutex);
+}
+
+#pragma mark - Wire helpers
+
+static inline int     WireChannel(int stream, int blk) { return stream * 2 + (~blk & 1); }
+
+#pragma mark - Device discovery and firmware
+
+static CFMutableDictionaryRef DeviceMatching(void)
+{
+    CFMutableDictionaryRef match = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!match) return NULL;
+    int vendor = NI_VID, product = PID_RUN;
+    CFNumberRef vid = CFNumberCreate(NULL, kCFNumberIntType, &vendor);
+    CFNumberRef pid = CFNumberCreate(NULL, kCFNumberIntType, &product);
+    if (!vid || !pid) {
+        if (vid) CFRelease(vid);
+        if (pid) CFRelease(pid);
+        CFRelease(match);
+        return NULL;
+    }
+    CFDictionarySetValue(match, CFSTR("idVendor"), vid);
+    CFDictionarySetValue(match, CFSTR("idProduct"), pid);
+    CFRelease(vid); CFRelease(pid);
+    return match;
+}
+
+static DevIf FindDevice(uint16_t *outPid, uint16_t *outRel)
+{
+    CFMutableDictionaryRef match = DeviceMatching();
+    if (!match) return NULL;
+
+    io_iterator_t iter = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &iter) != KERN_SUCCESS)
+        return NULL;
+
+    DevIf found = NULL;
+    io_service_t svc;
+    while ((svc = IOIteratorNext(iter))) {
+        IOCFPlugInInterface **plug = NULL;
+        SInt32 score = 0;
+        kern_return_t kr = IOCreatePlugInInterfaceForService(
+            svc, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID, &plug, &score);
+        IOObjectRelease(svc);
+        if (kr != KERN_SUCCESS || !plug) continue;
+
+        DevIf dev = NULL;
+        (*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID), (LPVOID *)&dev);
+        (*plug)->Release(plug);
+        if (!dev) continue;
+
+        UInt16 vid = 0, pid = 0, rel = 0;
+        (*dev)->GetDeviceVendor(dev, &vid);
+        (*dev)->GetDeviceProduct(dev, &pid);
+        (*dev)->GetDeviceReleaseNumber(dev, &rel);
+        if (vid == NI_VID && pid == PID_RUN) {
+            if (outPid) *outPid = pid;
+            if (outRel) *outRel = rel;
+            found = dev;
+            break;
+        }
+        (*dev)->Release(dev);
+    }
+    IOObjectRelease(iter);
+    return found;
+}
+
+// Registry-only discovery: do not open unrelated USB devices or claim the
+// audio interface while checking presence. The registry ID changes on replug.
+static uint64_t ReadyDeviceID(int *needsFirmware)
+{
+    *needsFirmware = 0;
+    CFMutableDictionaryRef match = DeviceMatching();
+    if (!match) return 0;
+    io_iterator_t iter = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &iter) != KERN_SUCCESS)
+        return 0;
+    uint64_t identity = 0;
+    io_service_t svc;
+    while ((svc = IOIteratorNext(iter))) {
+        CFTypeRef value = IORegistryEntryCreateCFProperty(svc, CFSTR("bcdDevice"), NULL, 0);
+        int release = 0;
+        if (value && CFGetTypeID(value) == CFNumberGetTypeID())
+            CFNumberGetValue(value, kCFNumberIntType, &release);
+        if (value) CFRelease(value);
+        if (release == BCD_UPLOADED)
+            IORegistryEntryGetRegistryEntryID(svc, &identity);
+        else if (release == 0x000e)
+            *needsFirmware = 1;
+        IOObjectRelease(svc);
+        if (identity) break;
+    }
+    IOObjectRelease(iter);
+    return identity;
+}
+
+// Called by the HAL presence worker, serialized with Start/Stop. Firmware
+// preparation stays on its own thread and is retried after every cold replug.
+uint64_t A8DJ_UsbPollDevice(void)
+{
+    if (g.buffersQuarantined || !g.buffersReady ||
+        (g.threadValid && g.started && !g.running)) return 0;
+    int needsFirmware = 0;
+    uint64_t identity = ReadyDeviceID(&needsFirmware);
+    if (g.prepBusy) return 0;
+    static CFAbsoluteTime nextPrepare = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!identity && needsFirmware && !g.threadValid && now >= nextPrepare) {
+        nextPrepare = now + 2.0;
+        g.prepDone = 0;
+        A8DJ_UsbPrepare();
+    }
+    return identity;
+}
+
+// The device boots from EEPROM at bcdDevice 0x000E; the bundled image reports
+// 0x0018. Uploading it makes the device drop off the bus and come back.
+static int UploadFirmware(DevIf dev)
+{
+    IOUSBDevRequest req = {
+        .bmRequestType = USBmakebmRequestType(kUSBOut, kUSBVendor, kUSBDevice),
+        .bRequest      = FX2_REQ_FWLOAD,
+        .wIndex        = 0,
+    };
+    uint8_t hold = 1, go = 0;
+
+    if ((*dev)->USBDeviceOpen(dev) != KERN_SUCCESS) return -1;
+
+    req.wValue = FX2_CPUCS; req.wLength = 1; req.pData = &hold;
+    if ((*dev)->DeviceRequest(dev, &req) != KERN_SUCCESS) goto fail;
+
+    for (size_t i = 0; i < NCHUNKS; i++) {
+        const FirmwareChunk *c = &audio8dj_firmware[i];
+        if (c->address == FX2_CPUCS) continue;
+        req.wValue  = c->address;
+        req.wLength = c->length;
+        req.pData   = (void *)c->data;
+        if ((*dev)->DeviceRequest(dev, &req) != KERN_SUCCESS) goto fail;
+    }
+
+    req.wValue = FX2_CPUCS; req.wLength = 1; req.pData = &go;
+    if ((*dev)->DeviceRequest(dev, &req) != KERN_SUCCESS) goto fail;
+
+    (*dev)->USBDeviceClose(dev);
+    return 0;
+
+fail:
+    (*dev)->USBDeviceClose(dev);
+    return -1;
+}
+
+static UInt8 FindPipe(IfIf intf, uint8_t epAddress)
+{
+    UInt8 n = 0;
+    (*intf)->GetNumEndpoints(intf, &n);
+    const UInt8 wantNum = epAddress & 0x0F;
+    const UInt8 wantDir = (epAddress & 0x80) ? kUSBIn : kUSBOut;
+
+    for (UInt8 i = 1; i <= n; i++) {
+        UInt8 dir = 0, num = 0, tt = 0, interval = 0;
+        UInt16 mps = 0;
+        if ((*intf)->GetPipeProperties(intf, i, &dir, &num, &tt, &mps, &interval) != KERN_SUCCESS)
+            continue;
+        if (num == wantNum && dir == wantDir) return i;
+    }
+    return 0;
+}
+
+static int Ep1Send(uint8_t cmd, const uint8_t *payload, int len)
+{
+    if (len < 0 || len > 63 || (len && !payload)) return -1;
+    uint8_t buf[64];
+    memset(buf, 0, sizeof(buf));
+    buf[0] = cmd;
+    if (payload && len > 0) memcpy(buf + 1, payload, (size_t)len);
+    return (*g.intf)->WritePipeTO(g.intf, g.pipeBulkOut, buf, (UInt32)(1 + len), 200, 500)
+           == KERN_SUCCESS ? 0 : -1;
+}
+
+static int Ep1Recv(uint8_t *buf, UInt32 cap, UInt32 *outLen)
+{
+    UInt32 got = cap;
+    if ((*g.intf)->ReadPipeTO(g.intf, g.pipeBulkIn, buf, &got, 200, 800) != KERN_SUCCESS)
+        return -1;
+    if (outLen) *outLen = got;
+    return 0;
+}
+
+// EP1 IN carries two unrelated things: the reply to whatever command we last
+// wrote, and MIDI the device pushes on its own. A packet left over from the
+// previous session desynchronises every exchange after it -- the reply to
+// GET_DEVICE_INFO is read as the reply to AUDIO_PARAMS, which is exactly the
+// "audio-params-no-ack" this used to fail with once MIDI IN started working.
+// So empty the pipe before talking to the device.
+static void Ep1Drain(void)
+{
+    uint8_t scratch[512];
+    for (int i = 0; i < 16; i++) {
+        UInt32 got = sizeof(scratch);
+        if ((*g.intf)->ReadPipeTO(g.intf, g.pipeBulkIn, scratch, &got, 20, 40) != KERN_SUCCESS)
+            return;                              // timed out: nothing left
+        if (got == 0) return;
+    }
+}
+
+// One command and its reply, with the pipe drained first and the command byte
+// checked, so a stray packet costs one retry instead of the whole session.
+static int Ep1Cmd(uint8_t cmd, const uint8_t *payload, int len,
+                  uint8_t *reply, UInt32 cap, UInt32 *outLen)
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        Ep1Drain();
+        if (Ep1Send(cmd, payload, len) != 0) continue;
+        UInt32 got = 0;
+        if (Ep1Recv(reply, cap, &got) != 0) continue;
+        if (got >= 1 && reply[0] == cmd) {
+            if (outLen) *outLen = got;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int RateCode(int rate)
+{
+    // The packet builder has a fixed-size stack array; refuse anything it
+    // cannot hold rather than overflow it.
+    if (rate > A8DJ_MAX_RATE) return -1;
+    switch (rate) {
+    case 44100:  return 0;
+    case 48000:  return 1;
+    case 96000:  return 2;
+    case 192000: return 3;
+    case 88200:  return 4;
+    default:     return -1;
+    }
+}
+
+#pragma mark - Sample conversion
+
+static float DecodeFrames(const uint8_t *src, int nFrames, uint64_t startFrame)
+{
+    float peak = 0;
+    uint64_t generation = g.clockSeed;
+    for (int f = 0; f < nFrames; f++) {
+        const uint8_t *fr  = src + (size_t)f * WIRE_FRAME_BYTES;
+        Float32 dst[A8DJ_CHANNELS];
+        uint64_t frame = startFrame + (uint64_t)f;
+        size_t slot = (size_t)(frame & RING_MASK);
+
+        for (int blk = 0; blk < WIRE_BLOCKS; blk++) {
+            const uint8_t *b = fr + blk * 16;
+            for (int s = 0; s < WIRE_STREAMS; s++) {
+                int32_t v = (b[4 + s] << 16) | (b[8 + s] << 8) | b[12 + s];
+                if (v & 0x800000) v -= 0x1000000;
+                float sample = (Float32)v * (1.0f / 8388608.0f);
+                dst[WireChannel(s, blk)] = sample;
+                if (fabsf(sample) > peak) peak = fabsf(sample);
+            }
+        }
+        A8DJ_RingWrite(g.capture + slot * A8DJ_CHANNELS, &g.captureSlots[slot],
+                       frame, generation, dst, A8DJ_CHANNELS);
+    }
+    return peak;
+}
+
+// The Windows driver never starts a packet on a block boundary: check bytes
+// land at packet offsets 8 and 24, and packet lengths are all multiples of 16
+// so that phase holds for the whole stream. Generating from one continuous
+// byte position reproduces that exactly.
+#define OUT_START_PHASE 24
+
+// src holds the sample frames this packet spans, in order; entry j is the frame
+// the block pair at wire index j carries.
+static void EncodeStream(uint8_t *dst, int nBytes, uint64_t bytePos,
+                         const Float32 (*src)[A8DJ_CHANNELS])
+{
+    uint64_t blk0 = (bytePos / 16) / 2;
+
+    for (int i = 0; i < nBytes; i++) {
+        uint64_t gp  = bytePos + (uint64_t)i;
+        uint64_t blk = gp / 16;
+        int      off = (int)(gp % 16);
+        int      par = (int)(~blk & 1);
+
+        if (off < 4) { dst[i] = (uint8_t)((off << 1) | par); continue; }
+
+        int plane = (off - 4) / 4;
+        int strm  = (off - 4) % 4;
+        int ch    = strm * 2 + par;
+
+        Float32 x = src[blk / 2 - blk0][ch];
+        if (!isfinite(x)) x = 0.0f;
+        if (x >  1.0f) x =  1.0f;
+        if (x < -1.0f) x = -1.0f;
+        int32_t v = (int32_t)(x * 8388607.0f);
+        dst[i] = (uint8_t)(v >> (16 - 8 * plane));
+    }
+}
+
+static int SamplesInUframe(uint64_t n)
+{
+    n %= 8000; // pattern repeats; multiplication cannot overflow on long runs
+    uint64_t end = ((n + 1) * (uint64_t)g.rate) / 8000;
+    uint64_t beg = (n * (uint64_t)g.rate) / 8000;
+    return (int)(end - beg);
+}
+
+#pragma mark - MIDI over EP1
+
+// EP 0x81 has to have a read outstanding at all times. The device pushes MIDI
+// IN bytes whether or not anything has opened a MIDI port, and when there is
+// no traffic the read simply never completes -- that is the normal state, not
+// an error.
+static void MidiRxComplete(void *refcon, IOReturn result, void *arg0);
+
+// Called from the EP1 completion, i.e. the time-constraint streaming thread.
+// Nothing here may block or touch the filesystem.
+static void MidiRingPut(const uint8_t *bytes, int count)
+{
+    if (!bytes || count <= 0) return;
+    unsigned head = atomic_load_explicit(&g.midiHead, memory_order_relaxed);
+    unsigned tail = atomic_load_explicit(&g.midiTail, memory_order_acquire);
+    unsigned free = (unsigned)sizeof(g.midiRing) - 1 - ((head - tail) & (unsigned)(sizeof(g.midiRing) - 1));
+    if ((unsigned)count > free) { g.midiLost += (unsigned)count - free; count = (int)free; }
+    for (int i = 0; i < count; i++)
+        g.midiRing[(head + (unsigned)i) & (sizeof(g.midiRing) - 1)] = bytes[i];
+    atomic_store_explicit(&g.midiHead, head + (unsigned)count, memory_order_release);
+}
+
+int A8DJ_UsbMidiReceive(uint8_t *buf, int cap)
+{
+    if (!buf || cap <= 0) return 0;
+    unsigned head = atomic_load_explicit(&g.midiHead, memory_order_acquire);
+    unsigned tail = atomic_load_explicit(&g.midiTail, memory_order_relaxed);
+    unsigned avail = (head - tail) & (unsigned)(sizeof(g.midiRing) - 1);
+    if ((unsigned)cap < avail) avail = (unsigned)cap;
+    for (unsigned i = 0; i < avail; i++)
+        buf[i] = g.midiRing[(tail + i) & (sizeof(g.midiRing) - 1)];
+    atomic_store_explicit(&g.midiTail, tail + avail, memory_order_release);
+    return (int)avail;
+}
+
+static void MidiRxPost(void)
+{
+    if (g.midiPosted || !g.running || !g.intf || !g.pipeBulkIn) return;
+    IOReturn r = (*g.intf)->ReadPipeAsync(g.intf, g.pipeBulkIn, g.midiRx,
+                                          sizeof(g.midiRx), MidiRxComplete, NULL);
+    g.midiPosted = (r == kIOReturnSuccess);
+}
+
+static void MidiRxComplete(void *refcon, IOReturn result, void *arg0)
+{
+    (void)refcon;
+    size_t n = (size_t)(uintptr_t)arg0;
+    g.midiPosted = 0;
+
+    if (g.running && result == kIOReturnSuccess && n >= 3 && n <= sizeof(g.midiRx)) {
+        uint8_t cmd = g.midiRx[0], len = g.midiRx[2];
+        g.midiPkts++;
+        if (cmd == EP1_CMD_MIDI_READ) {
+            if ((size_t)(3 + len) > n) len = (uint8_t)(n - 3);
+            g.midiIn += len;
+            MidiRingPut(g.midiRx + 3, len);
+        } else if (cmd == EP1_CMD_MIDI_WRITE) {
+            g.midiAcks++;   // the ACK for a MIDI_WRITE; carries no data
+        }
+    }
+    MidiRxPost();
+    if (!g.running && g.inflight == 0 && !g.midiPosted)
+        CFRunLoopStop(CFRunLoopGetCurrent());
+}
+
+int A8DJ_UsbMidiSend(const uint8_t *bytes, int count)
+{
+    if (!bytes || count < 1 || count > 250 || !g.inited) return -1;
+    // Test readiness under the same mutex Stop uses to retire the interface.
+    // A pre-lock check allowed a blocked sender to dereference a freed g.intf.
+    pthread_mutex_lock(&g.ep1Mutex);
+    if (!g.running || !g.intf || !g.pipeBulkOut || !g.midiPosted) {
+        pthread_mutex_unlock(&g.ep1Mutex);
+        return -1;
+    }
+
+    uint8_t buf[256];
+    buf[0] = EP1_CMD_MIDI_WRITE;
+    buf[1] = 0;
+    buf[2] = (uint8_t)count;
+    memcpy(buf + 3, bytes, (size_t)count);
+
+    IOReturn r = (*g.intf)->WritePipeTO(g.intf, g.pipeBulkOut, buf,
+                                        (UInt32)(3 + count), 200, 500);
+    pthread_mutex_unlock(&g.ep1Mutex);
+    if (r == kIOReturnSuccess) g.midiOut += (unsigned)count;
+    return (r == kIOReturnSuccess) ? 0 : -1;
+}
+
+#pragma mark - Isochronous transfer chain
+
+static void XferComplete(void *refcon, IOReturn result, void *arg0);
+
+// Isochronous callbacks have to be serviced within the queue's slack, or the
+// frame number the next transfer asked for has already gone by
+// (kIOReturnIsoTooOld). Measured with a plain thread: the run loop stalls
+// 8-15 ms several times a minute, more than any sane queue depth covers, and
+// both directions fail on the same bus frame. A time-constraint policy -- the
+// same kind CoreAudio gives its own IO threads -- removes them.
+static void SetRealtimeThread(double periodMs)
+{
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    double ticksPerMs = 1.0e6 * (double)tb.denom / (double)tb.numer;
+
+    thread_time_constraint_policy_data_t p;
+    p.period      = (uint32_t)(periodMs * ticksPerMs);
+    p.computation = (uint32_t)(periodMs * 0.25 * ticksPerMs);
+    p.constraint  = (uint32_t)(periodMs * 0.60 * ticksPerMs);
+    p.preemptible = 0;
+    thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                      THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p,
+                      THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+}
+
+// How far ahead of the current bus frame a resynchronised transfer is placed.
+// This is the size of the gap the device sees when a callback runs late, so
+// keep it small -- but far enough ahead that the retry cannot miss as well.
+#define RESYNC_FRAMES 4
+
+static UInt64 BusFrameNow(void)
+{
+    UInt64 f = 0;
+    AbsoluteTime at;
+    if (!g.intf) return 0;
+    if ((*g.intf)->GetBusFrameNumber(g.intf, &f, &at) != KERN_SUCCESS) return 0;
+    return f;
+}
+
+// Schedules one transfer, resynchronising to the current bus frame if the one
+// it asked for has already gone by (kIOReturnIsoTooOld). Without the retry a
+// single late callback retired that buffer permanently; once all of them had
+// gone the stream was silently dead -- output went quiet and the capture ring
+// stopped being refilled, so input read the same stale contents round and
+// round. The old 32 ms queue hid this; a 6 ms one does not.
+static int SubmitIn(int idx)
+{
+    if (!g.running || g.inRef[idx].pending) return 0;
+    for (int f = 0; f < XFER_UFRAMES; f++) {
+        g.inList[idx][f].frReqCount = ISO_MAXPKT;
+        g.inList[idx][f].frActCount = 0;
+        g.inList[idx][f].frStatus   = 0;
+    }
+    IOReturn r = (*g.intf)->ReadIsochPipeAsync(g.intf, g.pipeIsoIn, g.inBuf[idx], g.nextIn,
+                                               XFER_UFRAMES, g.inList[idx],
+                                               XferComplete, &g.inRef[idx]);
+    if (r != kIOReturnSuccess) {
+        UInt64 now = BusFrameNow();
+        if (!now) { g.submitFails++; return 0; }
+        g.nextIn = now + RESYNC_FRAMES;
+        g.resyncs++;
+        r = (*g.intf)->ReadIsochPipeAsync(g.intf, g.pipeIsoIn, g.inBuf[idx], g.nextIn,
+                                          XFER_UFRAMES, g.inList[idx],
+                                          XferComplete, &g.inRef[idx]);
+        if (r != kIOReturnSuccess) { g.submitFails++; return 0; }
+    }
+    g.nextIn += XFER_FRAMES;
+    g.inRef[idx].pending = 1;
+    g.inflight++;
+    return 1;
+}
+
+// How far the smoothed drift may wander before a microframe is lengthened or
+// shortened by one sample frame. Small enough that the device's own FIFO never
+// accumulates a whole microframe, large enough not to chase the sawtooth that
+// comes from IN arriving a transfer at a time.
+#define DRIFT_SLACK 2.0
+
+// Returns -1, 0 or +1: how many sample frames to add to this transfer.
+//
+// The microframe pattern in SamplesInUframe() is a function of the microframe
+// counter, so the output rate is locked to the host's USB SOF clock. The device
+// converts on its own crystal. Measured on this hardware the two differ by
+// about 46 ppm: out-read minus device grew from 192 to 247 frames over 25 s.
+// The device has to take every frame we send -- isochronous has no flow control
+// -- so its output FIFO fills until it sheds a whole microframe, 6 frames at
+// 48 kHz, roughly every 2.6 s. That is the periodic pop, and no amount of bus
+// power changes it.
+//
+// The IN stream is the device's own clock made visible, so steer by it: hold
+// (outFrames - deviceFrames) at the lead we publish. Only the packet boundaries
+// move; every sample CoreAudio wrote is still sent, in order, so the correction
+// itself is inaudible.
+static int DriftAdjust(void)
+{
+    // Wait for the input stream to be a meaningful rate reference.
+    if (g.deviceFrames < (uint64_t)(g.rate / 4)) return 0;
+
+    long err = (long)FrameDistance(g.outFrames, g.deviceFrames + g.leadFrames);
+    if (!g.driftPrimed) { g.driftAvg = (double)err; g.driftPrimed = 1; }
+    g.driftAvg += ((double)err - g.driftAvg) * 0.002;   // ~1 s time constant
+    g.lastDriftErr = (long)g.driftAvg;
+
+    int adjust = 0;
+    if (g.driftAvg >  DRIFT_SLACK) adjust = -1;
+    else if (g.driftAvg < -DRIFT_SLACK) adjust = +1;
+    if (adjust) {
+        // Account for the correction now, or the slow average would keep
+        // asking for it long after it has been applied.
+        g.driftAvg += adjust;
+        g.driftFix++;
+    }
+    return adjust;
+}
+
+static int SubmitOut(int idx)
+{
+    if (!g.running || g.outRef[idx].pending) return 0;
+    uint8_t *buf = g.outBuf[idx];
+    int adjust = DriftAdjust();
+    // WriteIsochPipeAsync reads one *contiguous* buffer: frame f starts at the
+    // sum of the preceding frReqCounts, not at a fixed stride. Laying the
+    // packets out at f * ISO_MAXPKT while declaring a shorter frReqCount fed
+    // the device len/ISO_MAXPKT real bytes and gaps for the rest, which is
+    // where the 192/512 = 0.375 pitch ratio came from.
+    size_t off = 0;
+    float peak = 0;
+
+    for (int f = 0; f < XFER_UFRAMES; f++) {
+        int n = SamplesInUframe(g.uframeCursor++);
+        // AUDIO_PARAMS told the device the largest packet it may expect, so a
+        // lengthened microframe has to stay inside that. At 44.1 kHz only the
+        // short microframes have room, hence "the first one that fits" rather
+        // than always the first.
+        int maxN = g.rate / 8000 + 1;
+        if (adjust && n + adjust >= 1 && n + adjust <= maxN) {
+            n += adjust;
+            adjust = 0;                  // one frame per transfer is plenty
+        }
+        int bytes = n * WIRE_FRAME_BYTES;
+
+        // Are the frames we are about to send ones CoreAudio has actually
+        // written? Reading past lastWriteEnd means putting whatever the ring
+        // still holds -- audio from a lap ago -- on the wire, which is a loud
+        // click. Send silence instead; that is what an underrun should sound
+        // like. It happens for the first few milliseconds of every session,
+        // before CoreAudio's first IOProc has run.
+        long margin = (long)FrameDistance(g.lastWriteEnd, g.outFrames + (uint64_t)n + 1);
+        int  ready  = (g.lastWriteEnd != 0) && margin >= 0;
+        if (g.lastWriteEnd) {
+            // The first second is always short: we start sending before
+            // CoreAudio's first IOProc has run. Counting it would bury the
+            // number that matters, which is the worst case once running.
+            if (g.deviceFrames > (uint64_t)g.rate) {
+                if (margin < g.outMarginMin) g.outMarginMin = margin;
+                if (!ready) g.outStarve++;
+            } else if (!ready) {
+                g.startStarve++;
+            }
+        }
+
+        // The packet starts 8 bytes into a block, so it straddles one more
+        // block pair than it fully contains: n + 1 source frames for n steps.
+        Float32 src[OUT_MAX_UFRAME_FRAMES + 1][A8DJ_CHANNELS];
+        if (ready) {
+            uint64_t generation = g.clockSeed;
+            for (int j = 0; j <= n; j++) {
+                uint64_t frame = g.outFrames + (uint64_t)j;
+                size_t slot = (size_t)(frame & RING_MASK);
+                A8DJ_RingRead(g.playback + slot * A8DJ_CHANNELS, &g.playbackSlots[slot],
+                             frame, generation, src[j], A8DJ_CHANNELS);
+            }
+        } else {
+            memset(src, 0, sizeof(src));
+        }
+
+        for (int j = 0; j <= n; j++)
+            for (int c = 0; c < A8DJ_CHANNELS; c++)
+                if (isfinite(src[j][c]) && fabsf(src[j][c]) > peak) peak = fabsf(src[j][c]);
+        EncodeStream(buf + off, bytes, g.outBytePos, src);
+
+        off            += (size_t)bytes;
+        g.outBytePos   += (uint64_t)bytes;
+        g.outFrames    += (uint64_t)n;
+        g.outList[idx][f].frReqCount = (UInt16)bytes;
+        g.outList[idx][f].frActCount = 0;
+        g.outList[idx][f].frStatus   = 0;
+    }
+    g.lastOutPeak = peak;
+    IOReturn r = (*g.intf)->WriteIsochPipeAsync(g.intf, g.pipeIsoOut, buf, g.nextOut,
+                                                XFER_UFRAMES, g.outList[idx],
+                                                XferComplete, &g.outRef[idx]);
+    if (r != kIOReturnSuccess) {
+        UInt64 now = BusFrameNow();
+        if (!now) { g.submitFails++; return 0; }
+        g.nextOut = now + RESYNC_FRAMES;
+        g.resyncs++;
+        r = (*g.intf)->WriteIsochPipeAsync(g.intf, g.pipeIsoOut, buf, g.nextOut,
+                                           XFER_UFRAMES, g.outList[idx],
+                                           XferComplete, &g.outRef[idx]);
+        if (r != kIOReturnSuccess) { g.submitFails++; return 0; }
+    }
+    g.nextOut += XFER_FRAMES;
+    g.outRef[idx].pending = 1;
+    g.inflight++;
+    return 1;
+}
+
+// Last resort: every buffer failed to go back out, so nothing will ever call
+// back again. Put the whole chain back on the bus from the current frame.
+static void RearmAll(void)
+{
+    if (!g.running) return;
+    UInt64 now = BusFrameNow();
+    if (!now) return;
+    g.nextIn = g.nextOut = now + RESYNC_FRAMES;
+    g.rearms++;
+    for (int i = 0; i < NBUF; i++) SubmitIn(i);
+    for (int i = 0; i < NBUF; i++) SubmitOut(i);
+    MidiRxPost();
+}
+
+static void XferComplete(void *refcon, IOReturn result, void *arg0)
+{
+    (void)arg0;
+    XferRef *ref = refcon;
+    if (!ref || !ref->pending) return;
+    ref->pending = 0;
+    g.inflight--;
+
+    if (result != kIOReturnSuccess) {
+        if (ref->isInput) g.xferErrIn++; else g.xferErrOut++;
+    }
+
+    // Per microframe status. The device reports a short or failed packet here
+    // and nowhere else, so this is the only place a bus-level dropout -- the
+    // signature of a power problem -- becomes visible.
+    if (!ref->isInput) {
+        for (int f = 0; f < XFER_UFRAMES; f++)
+            if (g.outList[ref->idx][f].frStatus != kIOReturnSuccess) g.frErrOut++;
+    }
+
+    if (g.running && ref->isInput && result == kIOReturnSuccess) {
+        // The device's own delivery is the clock: every frame that arrives
+        // advances the timeline the plug-in publishes to CoreAudio.
+        uint64_t pos = g.deviceFrames;
+        float ipk = 0;
+        for (int f = 0; f < XFER_UFRAMES; f++) {
+            UInt16 got = g.inList[ref->idx][f].frActCount;
+            int    n   = got / WIRE_FRAME_BYTES;
+            // We always ask for a full ISO_MAXPKT, so a packet carrying less
+            // is reported as kIOReturnUnderrun. That is the normal case here,
+            // not an error -- the device paces itself and sends nothing at all
+            // in roughly one microframe in seven.
+            IOReturn fs = g.inList[ref->idx][f].frStatus;
+            if (fs != kIOReturnSuccess && fs != kIOReturnUnderrun) { g.frErrIn++; continue; }
+            if (got > ISO_MAXPKT) { g.frErrIn++; continue; }
+            if (n <= 0) { g.shortIn++; continue; }
+            // A packet that is not a whole number of wire frames means the
+            // device truncated mid-frame; the leftover bytes are lost and the
+            // stream shifts, which is audible as a click.
+            if (got % WIRE_FRAME_BYTES) g.inGap++;
+            float peak = DecodeFrames(g.inBuf[ref->idx] + (size_t)f * ISO_MAXPKT, n, pos);
+            if (peak > ipk) ipk = peak;
+            pos += (uint64_t)n;
+        }
+        g.lastInPeak = ipk;
+        PublishClock(pos, mach_absolute_time(), 0);
+    }
+
+    if (g.running) {
+        if (ref->isInput) SubmitIn(ref->idx);
+        else              SubmitOut(ref->idx);
+        if (g.inflight == 0) RearmAll();
+    } else if (g.inflight == 0 && !g.midiPosted) {
+        CFRunLoopStop(CFRunLoopGetCurrent());
+    }
+}
+
+#pragma mark - Streaming thread
+
+static void SignalStart(int result)
+{
+    pthread_mutex_lock(&g.startMutex);
+    g.startResult = result;
+    g.started     = 1;
+    pthread_cond_signal(&g.startCond);
+    pthread_mutex_unlock(&g.startMutex);
+}
+
+static int OpenAndConfigure(void)
+{
+    uint16_t pid = 0, rel = 0;
+    DevIf dev = FindDevice(&pid, &rel);
+    if (!dev) { SetStatus("no-device"); return -1; }
+
+    if (rel != BCD_UPLOADED) {
+        // The device was replugged and is back on its EEPROM image. Hand the
+        // upload to the prepare thread and fail fast rather than blocking the
+        // host for the seconds it takes to re-enumerate.
+        // Only flag it; the next A8DJ_UsbStart spawns the upload. Spawning or
+        // joining the prepare thread from here would race the caller's own
+        // A8DJ_UsbPrepare on the CoreAudio thread.
+        (*dev)->Release(dev);
+        SetStatus("needs-firmware");
+        g.prepDone = 0;
+        return -1;
+    }
+    g.dev = dev;
+
+    if ((*dev)->USBDeviceOpen(dev) != KERN_SUCCESS) { SetStatus("open-busy"); return -1; }
+
+    UInt8 cfg = 0;
+    (*dev)->GetConfiguration(dev, &cfg);
+    if (cfg != 1) (*dev)->SetConfiguration(dev, 1);
+
+    IOUSBFindInterfaceRequest req = {
+        .bInterfaceClass    = kIOUSBFindInterfaceDontCare,
+        .bInterfaceSubClass = kIOUSBFindInterfaceDontCare,
+        .bInterfaceProtocol = kIOUSBFindInterfaceDontCare,
+        .bAlternateSetting  = kIOUSBFindInterfaceDontCare,
+    };
+    io_iterator_t iter = IO_OBJECT_NULL;
+    io_service_t  svc  = IO_OBJECT_NULL;
+    // After a replug the device can sit unconfigured, and macOS only publishes
+    // interface nubs once a configuration is set. GetConfiguration can still
+    // report 1 in that state, so setting it again and waiting for the nub to
+    // appear is the only reliable way through. Seen on hardware: without this
+    // the device enumerates but has no IOUSBHostInterface child at all.
+    for (int attempt = 0; attempt < 12 && !svc; attempt++) {
+        if (attempt) {
+            (*dev)->SetConfiguration(dev, 1);
+            usleep(150 * 1000);
+        }
+        if ((*dev)->CreateInterfaceIterator(dev, &req, &iter) == KERN_SUCCESS) {
+            svc = IOIteratorNext(iter);
+            IOObjectRelease(iter);
+        }
+    }
+    if (!svc) { SetStatus("no-interface"); return -1; }
+
+    IOCFPlugInInterface **plug = NULL;
+    SInt32 score = 0;
+    kern_return_t kr = IOCreatePlugInInterfaceForService(svc, kIOUSBInterfaceUserClientTypeID,
+                                                         kIOCFPlugInInterfaceID, &plug, &score);
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS || !plug) { SetStatus("no-intf-plugin"); return -1; }
+
+    (*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID182),
+                            (LPVOID *)&g.intf);
+    (*plug)->Release(plug);
+    if (!g.intf) { SetStatus("no-intf-iface"); return -1; }
+
+    if ((*g.intf)->USBInterfaceOpen(g.intf) != KERN_SUCCESS) { SetStatus("intf-busy"); return -1; }
+
+    // The isochronous endpoints only exist on alt setting 1.
+    if ((*g.intf)->SetAlternateInterface(g.intf, 1) != KERN_SUCCESS) {
+        SetStatus("alt1-failed");
+        return -1;
+    }
+
+    g.pipeBulkOut = FindPipe(g.intf, EP1_BULK_OUT);
+    g.pipeBulkIn  = FindPipe(g.intf, EP1_BULK_IN);
+    g.pipeIsoIn   = FindPipe(g.intf, EP_ISO_IN);
+    g.pipeIsoOut  = FindPipe(g.intf, EP_ISO_OUT);
+    if (!g.pipeBulkOut || !g.pipeBulkIn || !g.pipeIsoIn || !g.pipeIsoOut) {
+        SetStatus("pipes-missing");
+        return -1;
+    }
+
+    uint8_t reply[512];
+    UInt32  got = 0;
+    Ep1Cmd(EP1_CMD_GET_DEVICE_INFO, NULL, 0, reply, sizeof(reply), &got);
+
+    int rc = RateCode(g.rate);
+    if (rc < 0) { SetStatus("bad-rate"); return -1; }
+
+    // bpp is the largest packet the device should expect: one microframe's worth
+    // of sample frames plus one frame of slack.
+    int bpp = ((g.rate / 8000) + 1) * WIRE_FRAME_BYTES;
+    uint8_t params[5] = { (uint8_t)rc, DEPTH_24,
+                          (uint8_t)(bpp & 0xFF), (uint8_t)(bpp >> 8), 1 };
+    got = 0;
+    if (Ep1Cmd(EP1_CMD_AUDIO_PARAMS, params, sizeof(params),
+               reply, sizeof(reply), &got) != 0 || got < 2) {
+        SetStatus("audio-params-no-ack");
+        return -1;
+    }
+    if (reply[1] != 1) { SetStatus("audio-params-nak-%u", reply[1]); return -1; }
+
+    return 0;
+}
+
+// Last line of defence. If every buffer somehow failed to go back on the bus,
+// no completion will ever arrive to notice it, so nothing else would restart
+// the stream -- that is the state the device used to get stuck in.
+static void WatchdogFired(CFRunLoopTimerRef timer, void *info)
+{
+    (void)timer; (void)info;
+    if (!g.running && g.inflight == 0 && !g.midiPosted) {
+        CFRunLoopStop(CFRunLoopGetCurrent());
+        return;
+    }
+    if (g.running && g.inflight == 0) RearmAll();
+    else if (g.running) {
+        // A failed IN chain cannot recover by waiting for OUT to also fail.
+        for (int i = 0; i < NBUF; i++) {
+            if (!g.inRef[i].pending) SubmitIn(i);
+            if (!g.outRef[i].pending) SubmitOut(i);
+        }
+    }
+    // A read that fails to go back out would silently end the MIDI IN path,
+    // and nothing else would ever notice: the pipe is idle by design.
+    if (g.running && !g.midiPosted) MidiRxPost();
+}
+
+// The streaming thread runs under a time-constraint policy, so it must not do
+// file IO. This one publishes the counters instead, once a second.
+static void *MonitorThread(void *arg)
+{
+    (void)arg;
+    pthread_setname_np("Audio8DJ status");
+    // Created from the time-constraint thread; make sure it is an ordinary one,
+    // because it does file IO.
+    thread_standard_policy_data_t std = { 0 };
+    thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                      THREAD_STANDARD_POLICY, (thread_policy_t)&std,
+                      THREAD_STANDARD_POLICY_COUNT);
+    while (g.running) {
+        A8DJ_MidiInit();          // no-op once the ports exist
+        PublishStatus();
+        // Short naps so A8DJ_UsbStop, which joins this thread, is not held up
+        // for the best part of a second inside StopIO.
+        for (int i = 0; i < 20 && g.running; i++) usleep(50 * 1000);
+    }
+    return NULL;
+}
+
+static void *StreamThread(void *arg)
+{
+    (void)arg;
+    pthread_setname_np("Audio8DJ USB");
+    if (OpenAndConfigure() != 0) { PublishStatus(); SignalStart(-1); return NULL; }
+
+    CFRunLoopSourceRef src = NULL;
+    if ((*g.intf)->CreateInterfaceAsyncEventSource(g.intf, &src) != KERN_SUCCESS || !src) {
+        SetStatus("no-event-source");
+        SignalStart(-1);
+        return NULL;
+    }
+    // Retained so A8DJ_UsbStop can safely poke it even if this thread has
+    // already unwound; a run loop dies with its thread otherwise.
+    g.runLoop = CFRunLoopGetCurrent();
+    CFRetain(g.runLoop);
+    CFRunLoopAddSource(g.runLoop, src, kCFRunLoopDefaultMode);
+
+    UInt64 frame = 0;
+    AbsoluteTime at;
+    if ((*g.intf)->GetBusFrameNumber(g.intf, &frame, &at) != KERN_SUCCESS) {
+        SetStatus("no-bus-frame");
+        CFRunLoopRemoveSource(g.runLoop, src, kCFRunLoopDefaultMode);
+        CFRelease(src);
+        SignalStart(-1);
+        return NULL;
+    }
+    g.nextIn = g.nextOut = frame + 16;
+
+    // Stop may have timed out waiting for setup. Never resurrect a cancelled
+    // session after Stop cleared running, otherwise its join can wait forever.
+    pthread_mutex_lock(&g.startMutex);
+    if (g.cancelStart) {
+        pthread_mutex_unlock(&g.startMutex);
+        CFRunLoopRemoveSource(g.runLoop, src, kCFRunLoopDefaultMode);
+        CFRelease(src);
+        SignalStart(-1);
+        return NULL;
+    }
+    g.running = 1;
+    pthread_mutex_unlock(&g.startMutex);
+    PublishClock(0, mach_absolute_time(), 1);
+    g.outFrames      = 0;
+    g.outBytePos     = OUT_START_PHASE;
+    g.uframeCursor   = 0;
+    g.leadFrames     = A8DJ_UsbOutputLeadFrames((double)g.rate);
+
+    CFRunLoopTimerRef watchdog =
+        CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.25, 0.25,
+                             0, 0, WatchdogFired, NULL);
+    if (!watchdog) {
+        g.running = 0;
+        SetStatus("no-watchdog");
+        CFRunLoopRemoveSource(g.runLoop, src, kCFRunLoopDefaultMode);
+        CFRelease(src);
+        SignalStart(-1);
+        return NULL;
+    }
+    CFRunLoopAddTimer(g.runLoop, watchdog, kCFRunLoopDefaultMode);
+
+    for (int i = 0; i < NBUF; i++) SubmitIn(i);
+    for (int i = 0; i < NBUF; i++) SubmitOut(i);
+
+    // Only now, with the setup commands done, does the async reader take over
+    // EP1 IN. It stays posted for as long as we are running.
+    // The SPSC cursors live across sessions: resetting them races the MIDI
+    // consumer. It drains any remaining bytes in arrival order.
+    MidiRxPost();
+
+
+    int haveIn = 0, haveOut = 0;
+    for (int i = 0; i < NBUF; i++) {
+        haveIn += g.inRef[i].pending;
+        haveOut += g.outRef[i].pending;
+    }
+    if (!haveIn || !haveOut) {
+        g.running = 0;
+        SetStatus("initial-transfer-failed");
+    } else SetStatus("streaming");
+    if (g.running && pthread_create(&g.monThread, NULL, MonitorThread, NULL) == 0) g.monValid = 1;
+    SignalStart(g.running ? 0 : -1);
+
+    SetRealtimeThread((double)XFER_UFRAMES / 8.0);
+    CFRunLoopRun();
+    if (atomic_exchange(&g.running, 0)) SetStatus("usb-loop-ended");
+
+    if (watchdog) {
+        CFRunLoopRemoveTimer(g.runLoop, watchdog, kCFRunLoopDefaultMode);
+        CFRelease(watchdog);
+    }
+    CFRunLoopRemoveSource(g.runLoop, src, kCFRunLoopDefaultMode);
+    CFRelease(src);
+    return NULL;
+}
+
+#pragma mark - Public API
+
+// Prepare firmware on a worker thread so StartIO does not block for USB
+// re-enumeration. Presence monitoring retries preparation on cold replug.
+static void *PrepThread(void *arg)
+{
+    (void)arg;
+    pthread_setname_np("Audio8DJ prep");
+
+    uint16_t pid = 0, rel = 0;
+    DevIf dev = FindDevice(&pid, &rel);
+    if (dev) {
+        if (rel == 0x000e && UploadFirmware(dev) == 0) {
+            (*dev)->Release(dev);
+            dev = NULL;
+            for (int i = 0; i < 50 && !dev; i++) {
+                usleep(200 * 1000);
+                dev = FindDevice(&pid, &rel);
+                if (dev && rel != BCD_UPLOADED) { (*dev)->Release(dev); dev = NULL; }
+            }
+        }
+        if (dev) (*dev)->Release(dev);
+    }
+    g.prepDone = 1;
+    g.prepBusy = 0;
+    return NULL;
+}
+
+// Latency profile, read once when the plug-in is initialised.
+//
+//   /Users/Shared/audio8dj.conf          (editable without sudo)
+//   /Library/Preferences/com.sawada.audio8dj.conf
+//
+// Contents are one key per line:
+//   preset=safe | mid | low
+//   uframes=8|16|24|32     microframes per transfer
+//   nbuf=2|3|4             transfers in flight
+//
+// Read at Initialize only, so the latency the plug-in reports to CoreAudio
+// always matches what the engine actually does. Changing it needs
+// `sudo killall coreaudiod` -- plugin/set-latency.sh does both.
+static void ApplyProfile(int uframes, int nbuf)
+{
+    if (uframes >= 8 && uframes <= XFER_UFRAMES_MAX && (uframes % 8) == 0)
+        gUframes = uframes;
+    if (nbuf >= 2 && nbuf <= NBUF_MAX)
+        gNbuf = nbuf;
+}
+
+static void LoadConfig(void)
+{
+    static const char *paths[] = {
+        "/Users/Shared/audio8dj.conf",
+        "/Library/Preferences/com.sawada.audio8dj.conf",
+    };
+    for (size_t p = 0; p < sizeof(paths)/sizeof(paths[0]); p++) {
+        FILE *f = fopen(paths[p], "r");
+        if (!f) continue;
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            int v = 0;
+            if (strstr(line, "preset=safe"))      ApplyProfile(16, 4);
+            else if (strstr(line, "preset=mid"))  ApplyProfile(16, 3);
+            else if (strstr(line, "preset=low"))  ApplyProfile(8, 4);
+            else if (sscanf(line, " uframes = %d", &v) == 1) ApplyProfile(v, gNbuf);
+            else if (sscanf(line, " nbuf = %d", &v) == 1)    ApplyProfile(gUframes, v);
+        }
+        fclose(f);
+        break;
+    }
+}
+
+void A8DJ_UsbPrepare(void)
+{
+    if (!g.inited) {
+        LoadConfig();
+        pthread_mutex_init(&g.startMutex, NULL);
+        pthread_cond_init(&g.startCond, NULL);
+        pthread_mutex_init(&g.ep1Mutex, NULL);
+        // These outlive every streaming session. CoreAudio's IO thread can
+        // still be inside ReadCapture/WritePlayback when StopIO lands, and an
+        // aborted isochronous transfer can still complete after it, so freeing
+        // these per session would invalidate callbacks still using them.
+        g.capture  = calloc((size_t)RING_FRAMES * A8DJ_CHANNELS, sizeof(Float32));
+        g.playback = calloc((size_t)RING_FRAMES * A8DJ_CHANNELS, sizeof(Float32));
+        g.captureSlots = calloc(RING_FRAMES, sizeof(A8DJ_RingSlot));
+        g.playbackSlots = calloc(RING_FRAMES, sizeof(A8DJ_RingSlot));
+        if (g.captureSlots && g.playbackSlots) {
+            for (size_t i = 0; i < RING_FRAMES; i++) {
+                atomic_flag_clear(&g.captureSlots[i].busy);
+                atomic_flag_clear(&g.playbackSlots[i].busy);
+            }
+        }
+        for (int i = 0; i < NBUF_MAX; i++) {
+            g.inBuf[i]   = calloc(XFER_UFRAMES_MAX, ISO_MAXPKT);
+            g.outBuf[i]  = calloc(XFER_UFRAMES_MAX, ISO_MAXPKT);
+            g.inList[i]  = calloc(XFER_UFRAMES_MAX, sizeof(IOUSBIsocFrame));
+            g.outList[i] = calloc(XFER_UFRAMES_MAX, sizeof(IOUSBIsocFrame));
+            g.inRef[i]   = (XferRef){ i, 1, 0 };
+            g.outRef[i]  = (XferRef){ i, 0, 0 };
+        }
+        g.buffersReady = g.capture && g.playback && g.captureSlots && g.playbackSlots;
+        for (int i = 0; i < NBUF_MAX; i++)
+            if (!g.inBuf[i] || !g.outBuf[i] || !g.inList[i] || !g.outList[i]) g.buffersReady = 0;
+        g.inited = 1;
+        if (g.buffersReady) A8DJ_MidiInit();
+    }
+    // So the MIDI state is visible even when no audio is running.
+    PublishStatus();
+
+    if (g.prepBusy) return;
+    if (g.prepValid) { pthread_join(g.prepThread, NULL); g.prepValid = 0; }
+    if (g.prepDone) return;
+    g.prepBusy = 1;
+    if (pthread_create(&g.prepThread, NULL, PrepThread, NULL) == 0) g.prepValid = 1;
+    else { g.prepBusy = 0; g.prepDone = 1; }
+}
+
+// Clears only what belongs to one streaming session; the rings, the mutexes and
+// the prepare state must survive.
+static void ResetSession(void)
+{
+    g.pipeIsoIn = g.pipeIsoOut = g.pipeBulkOut = g.pipeBulkIn = 0;
+    g.runLoop        = NULL;
+    g.inflight       = 0;
+    g.started        = 0;
+    g.startResult    = 0;
+    g.cancelStart    = 0;
+    g.running        = 0;
+    g.nextIn         = g.nextOut = 0;
+    PublishClock(0, 0, 0);
+    g.outFrames      = 0;
+    g.outBytePos     = 0;
+    g.uframeCursor   = 0;
+    g.lastOutPeak    = g.lastInPeak = 0.0f;
+    g.lastDriftErr   = 0;
+    g.resyncs        = 0;
+    g.submitFails    = 0;
+    g.rearms         = 0;
+    g.lastWriteFrame = 0;
+    g.lastWriteEnd   = 0;
+    g.publishTick    = 0;
+    g.xferErrIn      = g.xferErrOut = 0;
+    g.frErrIn        = g.frErrOut = 0;
+    g.shortIn        = g.inGap = 0;
+    g.outStarve      = 0;
+    g.startStarve    = 0;
+    g.outMarginMin   = 1L << 30;
+    g.inStarve       = 0;
+    g.inMarginMin    = 1L << 30;
+    g.driftAvg       = 0.0;
+    g.driftPrimed    = 0;
+    g.driftFix       = 0;
+}
+
+int A8DJ_UsbStart(double inRate)
+{
+    if (!isfinite(inRate) || inRate < 1 || inRate > A8DJ_MAX_RATE ||
+        inRate != (double)(int)inRate || RateCode((int)inRate) < 0) return -1;
+    if (g.buffersQuarantined) return -1;
+    A8DJ_UsbPrepare();
+    if (g.running) return 0;
+    if (g.threadValid) return -1;
+
+    // Normally already done at Initialize; this only bites after a replug, and
+    // has to stay short so StartIO does not look hung to CoreAudio.
+    if (g.prepBusy || !g.prepDone) return -1;
+
+    ResetSession();
+    g.rate = (int)inRate;
+    if (!g.buffersReady) { SetStatus("no-memory"); return -1; }
+    // Generation tags invalidate old audio. Clearing live ring storage here
+    // raced the last HAL callback from the previous session.
+
+    if (pthread_create(&g.thread, NULL, StreamThread, NULL) != 0) {
+        SetStatus("thread-failed");
+        return -1;
+    }
+    g.threadValid = 1;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 5;
+
+    pthread_mutex_lock(&g.startMutex);
+    while (!g.started)
+        if (pthread_cond_timedwait(&g.startCond, &g.startMutex, &deadline) != 0) break;
+    int result = g.started ? g.startResult : -1;
+    pthread_mutex_unlock(&g.startMutex);
+
+    if (result != 0) A8DJ_UsbStop();
+    return result;
+}
+
+void A8DJ_UsbStop(void)
+{
+    if (!g.inited) return;
+    pthread_mutex_lock(&g.startMutex);
+    g.cancelStart = 1;
+    g.running = 0;
+    // Setup owns the interface until it signals completion. In the timeout
+    // path, touching/closing it concurrently with OpenAndConfigure is unsafe.
+    while (g.threadValid && !g.started)
+        pthread_cond_wait(&g.startCond, &g.startMutex);
+    pthread_mutex_unlock(&g.startMutex);
+
+    // A sender which was already in WritePipeTO must finish before any close.
+    pthread_mutex_lock(&g.ep1Mutex);
+    pthread_mutex_unlock(&g.ep1Mutex);
+    if (g.monValid) { pthread_join(g.monThread, NULL); g.monValid = 0; }
+
+    if (g.threadValid) {
+        // Make the queued isochronous transfers complete so the stream thread's
+        // callback sees inflight reach zero and stops its own run loop. Killing
+        // the run loop here instead left transfers pending in the kernel that
+        // later wrote into buffers the thread had already freed -- that is what
+        // took coreaudiod down after a few device switches.
+        if (g.intf) {
+            if (g.pipeIsoIn)  (*g.intf)->AbortPipe(g.intf, g.pipeIsoIn);
+            if (g.pipeIsoOut) (*g.intf)->AbortPipe(g.intf, g.pipeIsoOut);
+            if (g.pipeBulkIn) (*g.intf)->AbortPipe(g.intf, g.pipeBulkIn);
+        }
+        for (int i = 0; i < 200 && (g.inflight > 0 || g.midiPosted); i++) usleep(5 * 1000);
+        if (g.runLoop) CFRunLoopStop(g.runLoop);
+        pthread_join(g.thread, NULL);
+        g.threadValid = 0;
+        if (g.inflight > 0 || g.midiPosted) {
+            g.buffersQuarantined = 1;
+            SetStatus("undrained-usb-restart-required");
+        }
+        if (g.runLoop) { CFRelease(g.runLoop); g.runLoop = NULL; }
+    }
+
+    pthread_mutex_lock(&g.ep1Mutex);
+    if (g.intf) {
+        (*g.intf)->SetAlternateInterface(g.intf, 0);
+        (*g.intf)->USBInterfaceClose(g.intf);
+        (*g.intf)->Release(g.intf);
+        g.intf = NULL;
+    }
+    if (g.dev) {
+        (*g.dev)->USBDeviceClose(g.dev);
+        (*g.dev)->Release(g.dev);
+        g.dev = NULL;
+    }
+    pthread_mutex_unlock(&g.ep1Mutex);
+    if (strcmp(A8DJ_UsbStatus(), "streaming") == 0) SetStatus("stopped");
+    PublishStatus();
+}
+
+int A8DJ_UsbGetClock(uint64_t *outFrames, uint64_t *outHostTime, uint64_t *outSeed)
+{
+    if (!g.running) return 0;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint64_t sequence = atomic_load(&g.clockSequence);
+        if (sequence & 1) continue;
+        uint64_t frames = atomic_load(&g.deviceFrames);
+        uint64_t host = atomic_load(&g.deviceHostTime);
+        uint64_t seed = atomic_load(&g.clockSeed);
+        if (sequence != atomic_load(&g.clockSequence)) continue;
+        if (!g.running || !host) return 0;
+        if (outFrames) *outFrames = frames;
+        if (outHostTime) *outHostTime = host;
+        if (outSeed) *outSeed = seed + 1;
+        return 1;
+    }
+    // The caller keeps its last coherent timestamp; never publish half a pair.
+    return 0;
+}
+
+void A8DJ_UsbReadCapture(Float32 *outBuf, uint64_t inStartFrame, uint32_t inFrames)
+{
+    if (!outBuf) return;
+    if (!g.capture || !g.captureSlots || !g.running || UINT64_MAX - inStartFrame < inFrames) {
+        memset(outBuf, 0, (size_t)inFrames * A8DJ_CHANNELS * sizeof(Float32));
+        return;
+    }
+    uint64_t generation = g.clockSeed;
+    uint64_t have = g.deviceFrames;
+    if (have > (uint64_t)g.rate) {
+        // Saturate diagnostics rather than overflowing signed arithmetic.
+        long margin = have >= inStartFrame && have - inStartFrame <= LONG_MAX
+            ? (long)(have - inStartFrame) - (long)inFrames : -LONG_MAX;
+        if (margin < g.inMarginMin) g.inMarginMin = margin;
+        if (margin < 0) g.inStarve++;
+    }
+    for (uint32_t f = 0; f < inFrames; f++) {
+        uint64_t frame = inStartFrame + f;
+        if (have && frame >= have) frame = have - 1;
+        size_t slot = (size_t)(frame & RING_MASK);
+        A8DJ_RingRead(g.capture + slot * A8DJ_CHANNELS, &g.captureSlots[slot],
+                     frame, generation, outBuf + (size_t)f * A8DJ_CHANNELS, A8DJ_CHANNELS);
+    }
+}
+
+void A8DJ_UsbWritePlayback(const Float32 *inBuf, uint64_t inStartFrame, uint32_t inFrames)
+{
+    if (!inBuf || !g.playback || !g.playbackSlots || !g.running ||
+        UINT64_MAX - inStartFrame < inFrames) return;
+    uint64_t generation = g.clockSeed;
+    for (uint32_t f = 0; f < inFrames; f++) {
+        uint64_t frame = inStartFrame + f;
+        size_t slot = (size_t)(frame & RING_MASK);
+        A8DJ_RingWrite(g.playback + slot * A8DJ_CHANNELS, &g.playbackSlots[slot],
+                      frame, generation, inBuf + (size_t)f * A8DJ_CHANNELS, A8DJ_CHANNELS);
+    }
+    // Publish the watermark only after all stores, never before filling data.
+    g.lastWriteFrame = inStartFrame;
+    g.lastWriteEnd = inStartFrame + inFrames;
+}
