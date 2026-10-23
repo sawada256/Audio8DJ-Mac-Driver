@@ -171,6 +171,7 @@ static struct {
     _Atomic unsigned driftFix;                   // microframes lengthened or shortened
     _Atomic uint64_t lastWriteFrame;             // where CoreAudio last wrote
     _Atomic uint64_t lastWriteEnd;               // one past the last frame it wrote
+    _Atomic uint32_t lastWriteFrames;            // size of its last write (its buffer)
 
     // Pop-noise accounting. A click has exactly three possible origins and
     // these separate them:
@@ -182,6 +183,11 @@ static struct {
     _Atomic unsigned frErrIn, frErrOut;          // microframes with a non-zero frStatus
     _Atomic unsigned shortIn;                    // microframes the device left empty
     _Atomic unsigned outStarve;                  // output read ahead of CoreAudio
+    _Atomic unsigned outIdleEvents;              // times CoreAudio stopped writing output
+    int      outIdle;                            // streaming thread only
+    uint64_t outIdleStart;                       // frame where writes stopped
+    unsigned starveRun;                          // short microframes not yet classified
+    long     starveRunMin;
     _Atomic unsigned startStarve;                // same, but in the first second
     _Atomic long outMarginMin;               // closest approach, in frames
     _Atomic unsigned inStarve;                   // capture read ahead of the device
@@ -225,7 +231,8 @@ static struct {
     char status[64];
 } g;
 
-enum { EV_RESYNC_IN = 1, EV_RESYNC_OUT, EV_REARM, EV_CLOCK_RESET, EV_CLOCK_SPIKE };
+enum { EV_RESYNC_IN = 1, EV_RESYNC_OUT, EV_REARM, EV_CLOCK_RESET, EV_CLOCK_SPIKE,
+       EV_OUT_IDLE, EV_OUT_RESUME };
 #define EVENT_RING 64u
 
 // Streaming thread only. No locks, no IO.
@@ -380,6 +387,7 @@ static void PublishStatus(void)
             "resync=%u submitFail=%u rearm=%u\n"
             "USB: 転送失敗 in=%u out=%u  µframe異常 in=%u out=%u  空 in=%u  端数 in=%u\n"
             "出力枯渇=%u 回(起動時 %u)  最小余裕=%ld フレーム  クロック補正=%u 回\n"
+            "出力未使用=%u 回%s (CoreAudio が出力を書いていない間は枯渇に数えない)\n"
             "録音先読み=%u 回  最小余裕=%ld フレーム  欠落を無音で補完=%u フレーム\n"
             "クロック: 最大ずれ=%ld µs  フィルタ再始動=%u 回\n"
             "resync 内訳: IN=%u OUT=%u  完了遅延最大=%d ms\n"
@@ -397,6 +405,7 @@ static void PublishStatus(void)
             g.resyncs, g.submitFails, g.rearms,
             g.xferErrIn, g.xferErrOut, g.frErrIn, g.frErrOut, g.shortIn, g.inGap,
             g.outStarve, g.startStarve, g.outMarginMin, g.driftFix,
+            g.outIdleEvents, g.outIdle ? " (現在 未使用)" : "",
             g.inStarve, g.inMarginMin, g.inLostFrames,
             g.clockErrMaxUs, g.clockResets,
             g.resyncsIn, g.resyncsOut, g.cbLateMaxMs,
@@ -1056,6 +1065,46 @@ static int DriftAdjust(void)
     return adjust;
 }
 
+// Output starvation and "nobody is writing output" look the same from here:
+// the ring is behind. IO keeps running for input-only clients, and then every
+// microframe used to count as a starve (33,000 in an hour, margins of minus
+// four seconds). So a run of short microframes is held back: if CoreAudio
+// writes again it was a real starve and is counted; if it falls further behind
+// than a writer ever would, the output is idle and the run is discarded.
+static void CountOutputMargin(long margin, int ready)
+{
+    if (ready) {
+        if (g.outIdle) {
+            g.outIdle = 0;
+            uint64_t idleFrames = g.outFrames - g.outIdleStart;
+            PushEvent(EV_OUT_RESUME, (int)(idleFrames * 1000 / (uint64_t)g.rate), 0, 0);
+        }
+        if (g.starveRun) {
+            g.outStarve += g.starveRun;
+            if (g.starveRunMin < g.outMarginMin) g.outMarginMin = g.starveRunMin;
+            AtomicMinLong(&g.outMarginWin, g.starveRunMin);
+            g.starveRun = 0;
+        }
+        if (margin < g.outMarginMin) g.outMarginMin = margin;
+        AtomicMinLong(&g.outMarginWin, margin);
+        return;
+    }
+    if (g.outIdle) return;
+    // A live writer stays ahead of us by its safety offset plus a buffer.
+    // Two of its buffers plus 10 ms behind means it has stopped writing.
+    long idleAfter = 2L * (long)g.lastWriteFrames + g.rate / 100;
+    if (-margin > idleAfter) {
+        g.outIdle = 1;
+        g.outIdleEvents++;
+        g.outIdleStart = g.lastWriteEnd;
+        PushEvent(EV_OUT_IDLE, (int)g.starveRun, 0, 0);
+        g.starveRun = 0;
+        return;
+    }
+    if (!g.starveRun || margin < g.starveRunMin) g.starveRunMin = margin;
+    g.starveRun++;
+}
+
 static int SubmitOut(int idx)
 {
     if (!g.running || g.outRef[idx].pending) return 0;
@@ -1098,13 +1147,8 @@ static int SubmitOut(int idx)
             // The first second is always short: we start sending before
             // CoreAudio's first IOProc has run. Counting it would bury the
             // number that matters, which is the worst case once running.
-            if (g.deviceFrames > (uint64_t)g.rate) {
-                if (margin < g.outMarginMin) g.outMarginMin = margin;
-                AtomicMinLong(&g.outMarginWin, margin);
-                if (!ready) g.outStarve++;
-            } else if (!ready) {
-                g.startStarve++;
-            }
+            if (g.deviceFrames > (uint64_t)g.rate) CountOutputMargin(margin, ready);
+            else if (!ready) g.startStarve++;
         }
 
         // The packet starts 8 bytes into a block, so it straddles one more
@@ -1392,14 +1436,14 @@ static void WatchdogFired(CFRunLoopTimerRef timer, void *info)
 // file IO. This one publishes the counters instead, once a second.
 typedef struct {
     unsigned resyncIn, resyncOut, rearms, inStarve, outStarve, lost;
-    unsigned frErrIn, frErrOut, xferErrIn, xferErrOut, clockResets;
+    unsigned frErrIn, frErrOut, xferErrIn, xferErrOut, clockResets, outIdle;
 } CounterSnapshot;
 
 static CounterSnapshot TakeSnapshot(void)
 {
     return (CounterSnapshot){
         g.resyncsIn, g.resyncsOut, g.rearms, g.inStarve, g.outStarve, g.inLostFrames,
-        g.frErrIn, g.frErrOut, g.xferErrIn, g.xferErrOut, g.clockResets };
+        g.frErrIn, g.frErrOut, g.xferErrIn, g.xferErrOut, g.clockResets, g.outIdleEvents };
 }
 
 static double SessionSeconds(uint64_t host)
@@ -1450,6 +1494,14 @@ static void MonitorTick(FILE *log, CounterSnapshot *prev)
         case EV_CLOCK_RESET:
             fprintf(log, "[%s t=%.3fs] クロックフィルタ再始動: ずれ %+d ms\n", wall, t, a);
             break;
+        case EV_OUT_IDLE:
+            fprintf(log, "[%s t=%.3fs] 出力未使用: CoreAudio の書き込みが止まった (直前の不足 %d µframe は枯渇に数えない)\n",
+                    wall, t, a);
+            break;
+        case EV_OUT_RESUME:
+            fprintf(log, "[%s t=%.3fs] 出力再開: 停止 %d ms%s\n", wall, t, a,
+                    a < 1000 ? "  ※短い停止は書き込み側の遅れ(実際の音切れ)の可能性" : "");
+            break;
         case EV_CLOCK_SPIKE:
             fprintf(log, "[%s t=%.3fs] クロックずれ %+d µs (到着が線より%s)\n",
                     wall, t, a, a > 0 ? "遅い" : "早い");
@@ -1466,11 +1518,12 @@ static void MonitorTick(FILE *log, CounterSnapshot *prev)
         FormatMargin(inM, sizeof(inM), inWin);
         FormatMargin(outM, sizeof(outM), outWin);
         fprintf(log, "[%s t=%.0fs] 1秒集計: resync IN+%u OUT+%u rearm+%u | 録音先読み+%u (最小余裕 %s) | "
-                     "出力枯渇+%u (最小余裕 %s) | 欠落補完+%u | µframe異常 in+%u out+%u | "
+                     "出力枯渇+%u (最小余裕 %s) | 出力未使用+%u | 欠落補完+%u | µframe異常 in+%u out+%u | "
                      "転送失敗 in+%u out+%u | フィルタ再始動+%u | クロック最大ずれ %ld µs | 完了遅延最大 %d ms\n",
                 wall, SessionSeconds(mach_absolute_time()),
                 cur.resyncIn - prev->resyncIn, cur.resyncOut - prev->resyncOut, cur.rearms - prev->rearms,
                 cur.inStarve - prev->inStarve, inM, cur.outStarve - prev->outStarve, outM,
+                cur.outIdle - prev->outIdle,
                 cur.lost - prev->lost, cur.frErrIn - prev->frErrIn, cur.frErrOut - prev->frErrOut,
                 cur.xferErrIn - prev->xferErrIn, cur.xferErrOut - prev->xferErrOut,
                 cur.clockResets - prev->clockResets, errWin, lateWin);
@@ -1775,6 +1828,12 @@ static void ResetSession(void)
     g.frErrIn        = g.frErrOut = 0;
     g.shortIn        = g.inGap = 0;
     g.outStarve      = 0;
+    g.outIdleEvents  = 0;
+    g.outIdle        = 0;
+    g.outIdleStart   = 0;
+    g.starveRun      = 0;
+    g.starveRunMin   = 0;
+    g.lastWriteFrames = 0;
     g.startStarve    = 0;
     g.outMarginMin   = 1L << 30;
     g.inStarve       = 0;
@@ -1923,9 +1982,13 @@ void A8DJ_UsbReadCapture(Float32 *outBuf, uint64_t inStartFrame, uint32_t inFram
     uint64_t generation = g.clockSeed;
     uint64_t have = g.deviceFrames;
     if (have > (uint64_t)g.rate) {
-        // Saturate diagnostics rather than overflowing signed arithmetic.
-        long margin = have >= inStartFrame && have - inStartFrame <= LONG_MAX
-            ? (long)(have - inStartFrame) - (long)inFrames : -LONG_MAX;
+        // Signed distance in both directions: a read that starts past `have`
+        // is a shortfall of exactly that many frames, not "infinitely short".
+        // FrameDistance saturates at +-INT64_MAX, so only the subtraction can
+        // still overflow.
+        int64_t ahead = FrameDistance(have, inStartFrame);
+        long margin = ahead < -INT64_MAX + (int64_t)inFrames
+            ? -LONG_MAX : (long)(ahead - (int64_t)inFrames);
         if (margin < g.inMarginMin) g.inMarginMin = margin;
         AtomicMinLong(&g.inMarginWin, margin);
         if (margin < 0) g.inStarve++;
@@ -1953,6 +2016,7 @@ void A8DJ_UsbWritePlayback(const Float32 *inBuf, uint64_t inStartFrame, uint32_t
                       frame, generation, inBuf + (size_t)f * A8DJ_CHANNELS, A8DJ_CHANNELS);
     }
     // Publish the watermark only after all stores, never before filling data.
+    g.lastWriteFrames = inFrames;
     g.lastWriteFrame = inStartFrame;
     g.lastWriteEnd = inStartFrame + inFrames;
 }

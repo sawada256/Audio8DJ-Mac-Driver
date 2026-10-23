@@ -383,6 +383,48 @@ static void TestDiagnostics(void)
     ResetSession();
 }
 
+// Margins are signed both ways; idle output is not a starve.
+static void TestMargins(void)
+{
+    ResetSession();
+    g.rate = 48000;
+    g.capture = calloc(RING_FRAMES * A8DJ_CHANNELS, sizeof(Float32));
+    g.captureSlots = calloc(RING_FRAMES, sizeof(A8DJ_RingSlot));
+    for (size_t i = 0; i < RING_FRAMES; i++) atomic_flag_clear(&g.captureSlots[i].busy);
+    g.running = 1;
+    PublishClock(48100, 100, 1);
+    Float32 out[10][A8DJ_CHANNELS];
+    A8DJ_UsbReadCapture(&out[0][0], 48150, 10);    // starts 50 past the newest frame
+    assert(g.inStarve == 1 && g.inMarginMin == -60 && g.inMarginWin == -60);
+    A8DJ_UsbReadCapture(&out[0][0], 48000, 10);
+    assert(g.inStarve == 1 && g.inMarginMin == -60);
+    g.running = 0;
+    free(g.capture); free(g.captureSlots);
+    g.capture = NULL; g.captureSlots = NULL;
+
+    // A short run that ends with CoreAudio writing again is a real starve.
+    g.lastWriteFrames = 512;                       // idle after 2*512 + 480 behind
+    CountOutputMargin(100, 1);
+    CountOutputMargin(-5, 0); CountOutputMargin(-20, 0); CountOutputMargin(-30, 0);
+    assert(g.outStarve == 0);                      // held until classified
+    CountOutputMargin(50, 1);
+    assert(g.outStarve == 3 && g.outMarginMin == -30 && !g.outIdle);
+    // A run that falls behind further than any writer would is idle output.
+    unsigned head = g.evHead;
+    CountOutputMargin(-10, 0); CountOutputMargin(-800, 0); CountOutputMargin(-1600, 0);
+    assert(g.outIdle && g.outIdleEvents == 1 && g.outStarve == 3);
+    CountOutputMargin(-200000, 0);
+    assert(g.outStarve == 3 && g.outMarginMin == -30);
+    g.outFrames = 48000; g.outIdleStart = 24000;
+    CountOutputMargin(400, 1);
+    assert(!g.outIdle && g.outStarve == 3 && g.outMarginMin == -30);
+    assert(g.evHead == head + 2);
+    assert(g.events[head % EVENT_RING].kind == EV_OUT_IDLE && g.events[head % EVENT_RING].a == 2);
+    assert(g.events[(head + 1) % EVENT_RING].kind == EV_OUT_RESUME &&
+           g.events[(head + 1) % EVENT_RING].a == 500);
+    ResetSession();
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--probe") == 0) {
@@ -416,5 +458,6 @@ int main(int argc, char **argv)
     TestCaptureBeyondHave();
     TestConversion();
     TestDiagnostics();
-    puts("PASS: startup cancellation, stale/quarantined buffers, MIDI ownership, audio bounds, coherent clock, IN loss/gaps, clock filter, capture past end, conversion, diagnostics");
+    TestMargins();
+    puts("PASS: startup cancellation, stale/quarantined buffers, MIDI ownership, audio bounds, coherent clock, IN loss/gaps, clock filter, capture past end, conversion, diagnostics, signed margins, idle output");
 }

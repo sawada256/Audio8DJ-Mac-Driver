@@ -9,6 +9,7 @@
 - 再生中のサンプルレート変更を拒否せず、USB を新レートで再起動するようにしました。
 - 出力の float→24bit 変換を 2^23 基準の丸めに変更し、24bit 音源をビット単位で再現するようにしました。サンプル変換は1回だけ行います。
 - 診断: resync を IN/OUT 別に集計し、直近1秒のクロック最大ずれ・完了遅延・最小余裕を状態ファイルに表示。発生時刻つきのイベントログ `/tmp/a8dj-events.log` を追加。
+- 診断の修正: 録音の最小余裕が -LONG_MAX に張り付かず実際の不足フレーム数を示すように。CoreAudio が出力を書いていない間（入力のみ使用など）は出力枯渇に数えず「出力未使用」として別集計し、停止・再開をイベントログに記録。
 - 余裕を調整する設定キー `in_margin_us` / `out_margin_us` を追加。`set-latency.sh` は preset 以外の設定を保持します。
 
 - Output latency no longer counts the USB queue lead twice; device latency is reported from `hw_latency_in_us` / `hw_latency_out_us`.
@@ -18,6 +19,7 @@
 - Sample-rate changes while running restart USB at the new rate instead of failing.
 - Float to 24-bit output uses 2^23 scaling with rounding (bit-exact for 24-bit sources).
 - Diagnostics: per-direction resync counts, last-second clock error / completion delay / margins in the status file, and a timestamped event log at `/tmp/a8dj-events.log`.
+- Diagnostics fixes: capture margin reports the actual shortfall instead of saturating at -LONG_MAX; output with no CoreAudio writer (input-only use) is counted as idle, not as starvation, with idle/resume events logged.
 - New `in_margin_us` / `out_margin_us` keys; `set-latency.sh` keeps non-preset settings.
 
 ## [0.1.0] - 2026-09-13
