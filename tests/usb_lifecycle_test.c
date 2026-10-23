@@ -5,6 +5,8 @@ static FILE *TestOpen(const char *path, const char *mode)
 { (void)path; (void)mode; return tmpfile(); }
 static FILE *TestStatusOpen(const char *path) { (void)path; return tmpfile(); }
 #define A8DJ_STATUS_OPEN TestStatusOpen
+static FILE *TestLogOpen(const char *path, off_t max) { (void)path; (void)max; return tmpfile(); }
+#define A8DJ_LOG_OPEN TestLogOpen
 #define fopen TestOpen
 #include "../plugin/usb_engine.c"
 #undef fopen
@@ -336,6 +338,51 @@ static void TestConversion(void)
     assert(A8DJ_FloatToS24(NAN) == 0 && A8DJ_FloatToS24(INFINITY) == 0);
 }
 
+// Diagnostics: resyncs are split by direction, the event ring reaches the
+// log with its details, and per-second windows reset after each look.
+static void TestDiagnostics(void)
+{
+    ResetSession();
+    g.rate = 48000;
+    g.sessionHost = mach_absolute_time();
+    FILE *log = tmpfile();
+    assert(log);
+    CounterSnapshot prev = TakeSnapshot();
+    MonitorTick(log, &prev);                       // quiet second: nothing logged
+    assert(ftell(log) == 0);
+
+    g.resyncsIn++;
+    PushEvent(EV_RESYNC_IN, 3, 56, 0);
+    PushEvent(EV_CLOCK_SPIKE, 960, 0, 0);
+    AtomicMaxLong(&g.clockErrWinUs, 960);
+    AtomicMaxInt(&g.cbLateWinMs, 5);
+    AtomicMinLong(&g.inMarginWin, -50);
+    g.inStarve++;
+    MonitorTick(log, &prev);
+    assert(gSecClockErrUs == 960 && gSecCbLateMs == 5 && gSecInMargin == -50);
+    assert(g.clockErrWinUs == 0 && g.cbLateWinMs == 0 && g.inMarginWin == (1L << 30));
+
+    char text[4096] = {0};
+    rewind(log);
+    fread(text, 1, sizeof(text) - 1, log);
+    assert(strstr(text, "resync IN : 予定フレームを 3 ms 過ぎていた  欠落 7.000 ms"));
+    assert(strstr(text, "クロックずれ +960 µs"));
+    assert(strstr(text, "resync IN+1 OUT+0"));
+    assert(strstr(text, "録音先読み+1 (最小余裕 -50)"));
+    assert(strstr(text, "完了遅延最大 5 ms"));
+
+    // More events than the ring holds: the overflow is reported, not replayed.
+    for (int i = 0; i < 70; i++) PushEvent(EV_RESYNC_OUT, 1, 8, 0);
+    long before = ftell(log);
+    MonitorTick(log, &prev);
+    memset(text, 0, sizeof(text));
+    fseek(log, before, SEEK_SET);
+    fread(text, 1, sizeof(text) - 1, log);
+    assert(strstr(text, "イベント 6 件を取りこぼし"));
+    fclose(log);
+    ResetSession();
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--probe") == 0) {
@@ -368,5 +415,6 @@ int main(int argc, char **argv)
     TestClockFilter();
     TestCaptureBeyondHave();
     TestConversion();
-    puts("PASS: startup cancellation, stale/quarantined buffers, MIDI ownership, audio bounds, coherent clock, IN loss/gaps, clock filter, capture past end, conversion");
+    TestDiagnostics();
+    puts("PASS: startup cancellation, stale/quarantined buffers, MIDI ownership, audio bounds, coherent clock, IN loss/gaps, clock filter, capture past end, conversion, diagnostics");
 }

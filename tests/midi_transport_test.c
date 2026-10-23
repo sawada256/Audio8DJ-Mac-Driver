@@ -70,8 +70,10 @@ int main(void)
     assert(!symlink(target, path));
     assert(A8DJ_OpenMidiFifo(path) == -1);
     assert(!A8DJ_OpenStatusFile(path));
+    assert(!A8DJ_OpenLogFile(path, 1 << 20));
     unlink(path);
     assert(!link(target, path));
+    assert(!A8DJ_OpenLogFile(path, 1 << 20));
     assert(!A8DJ_OpenStatusFile(path));
     assert(!stat(target, &st) && st.st_size == sizeof(data));
     unlink(path);
@@ -82,6 +84,13 @@ int main(void)
     assert(status);
     fputs("status", status); fclose(status);
     assert(!stat(path, &st) && st.st_size == 6);
+    // The event log appends, and starts over once past its size limit.
+    FILE *log = A8DJ_OpenLogFile(path, 8);
+    assert(log); fputs("ab", log); fclose(log);
+    assert(!stat(path, &st) && st.st_size == 8);
+    log = A8DJ_OpenLogFile(path, 4);
+    assert(log); fputs("xy", log); fclose(log);
+    assert(!stat(path, &st) && st.st_size == 2);
     unlink(path); unlink(target); rmdir(directory);
-    puts("PASS: MIDI partial-write queue, capacity, cursor wrap, safe FIFO/status file handling");
+    puts("PASS: MIDI partial-write queue, capacity, cursor wrap, safe FIFO/status/log file handling");
 }

@@ -21,4 +21,22 @@ static inline FILE *A8DJ_OpenStatusFile(const char *path)
     if (!file) close(fd);
     return file;
 }
+
+// Same checks, but appends. Starts over once the log passes maxBytes so a
+// long-running session cannot fill /tmp.
+static inline FILE *A8DJ_OpenLogFile(const char *path, off_t maxBytes)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0644);
+    if (fd < 0) return NULL;
+    struct stat info;
+    if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_nlink != 1 || info.st_uid != geteuid() ||
+        (info.st_size > maxBytes && ftruncate(fd, 0) != 0)) {
+        close(fd);
+        return NULL;
+    }
+    FILE *file = fdopen(fd, "a");
+    if (!file) close(fd);
+    return file;
+}
 #endif

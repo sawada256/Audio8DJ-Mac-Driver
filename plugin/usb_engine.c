@@ -15,6 +15,11 @@
 #ifndef A8DJ_STATUS_OPEN
 #define A8DJ_STATUS_OPEN A8DJ_OpenStatusFile
 #endif
+#ifndef A8DJ_LOG_OPEN
+#define A8DJ_LOG_OPEN A8DJ_OpenLogFile
+#endif
+#define A8DJ_EVENT_LOG "/tmp/a8dj-events.log"
+#include <time.h>
 #include <math.h>
 #include <limits.h>
 
@@ -199,8 +204,59 @@ static struct {
     _Atomic long     clockErrMaxUs;              // worst raw-vs-filtered disagreement
     _Atomic unsigned clockResets;                // filter restarts after a jump
 
+    // Diagnostics, to tell apart what a single cumulative counter cannot:
+    // which direction fell behind, how late the callbacks were running, and
+    // whether clock error is constant or only appears around those events.
+    _Atomic unsigned resyncsIn, resyncsOut;
+    _Atomic long     clockErrWinUs;              // max since the monitor last looked
+    _Atomic int      cbLateWinMs, cbLateMaxMs;   // IN completion delay past its last bus frame
+    _Atomic long     inMarginWin, outMarginWin;  // closest approach since last look
+    uint64_t         sessionHost;                // mach time streaming started
+    uint64_t         lastSpikeHost;              // rate-limits clock-spike events
+    // Events from the streaming thread (single producer) to the monitor
+    // thread (single consumer). Overwrites when full; the consumer notices.
+    struct {
+        uint64_t host;
+        int      kind, a, b;
+    } events[64];
+    _Atomic unsigned evHead;
+    unsigned evTail;
+
     char status[64];
 } g;
+
+enum { EV_RESYNC_IN = 1, EV_RESYNC_OUT, EV_REARM, EV_CLOCK_RESET, EV_CLOCK_SPIKE };
+#define EVENT_RING 64u
+
+// Streaming thread only. No locks, no IO.
+static void PushEvent(int kind, int a, int b, uint64_t host)
+{
+    unsigned head = atomic_load_explicit(&g.evHead, memory_order_relaxed);
+    unsigned i = head % EVENT_RING;
+    g.events[i].host = host ? host : mach_absolute_time();
+    g.events[i].kind = kind;
+    g.events[i].a = a;
+    g.events[i].b = b;
+    atomic_store_explicit(&g.evHead, head + 1, memory_order_release);
+}
+
+static inline void AtomicMaxLong(_Atomic long *v, long x)
+{
+    long cur = atomic_load_explicit(v, memory_order_relaxed);
+    while (x > cur && !atomic_compare_exchange_weak(v, &cur, x)) {}
+}
+
+static inline void AtomicMinLong(_Atomic long *v, long x)
+{
+    long cur = atomic_load_explicit(v, memory_order_relaxed);
+    while (x < cur && !atomic_compare_exchange_weak(v, &cur, x)) {}
+}
+
+static inline void AtomicMaxInt(_Atomic int *v, int x)
+{
+    int cur = atomic_load_explicit(v, memory_order_relaxed);
+    while (x > cur && !atomic_compare_exchange_weak(v, &cur, x)) {}
+}
 
 static void PublishClock(uint64_t frames, uint64_t hostTime, int newSession)
 {
@@ -291,9 +347,23 @@ static int64_t FrameDistance(uint64_t a, uint64_t b)
     return b - a > INT64_MAX ? -INT64_MAX : -(int64_t)(b - a);
 }
 
+// Per-second view, kept by the monitor thread and shown in the status file.
+static _Atomic long gSecClockErrUs;
+static _Atomic long gSecInMargin = 1L << 30, gSecOutMargin = 1L << 30;
+static _Atomic int  gSecCbLateMs;
+
+static void FormatMargin(char *buf, size_t cap, long v)
+{
+    if (v >= (1L << 30)) snprintf(buf, cap, "-");
+    else snprintf(buf, cap, "%ld", v);
+}
+
 // The device name is cached by CoreAudio, so it cannot report live state.
 static void PublishStatus(void)
 {
+    char secIn[24], secOut[24];
+    FormatMargin(secIn, sizeof(secIn), gSecInMargin);
+    FormatMargin(secOut, sizeof(secOut), gSecOutMargin);
     pthread_mutex_lock(&gStatusFileMutex);
     FILE *f = A8DJ_STATUS_OPEN("/tmp/a8dj-status.txt");
     if (!f) { pthread_mutex_unlock(&gStatusFileMutex); return; }
@@ -312,6 +382,9 @@ static void PublishStatus(void)
             "出力枯渇=%u 回(起動時 %u)  最小余裕=%ld フレーム  クロック補正=%u 回\n"
             "録音先読み=%u 回  最小余裕=%ld フレーム  欠落を無音で補完=%u フレーム\n"
             "クロック: 最大ずれ=%ld µs  フィルタ再始動=%u 回\n"
+            "resync 内訳: IN=%u OUT=%u  完了遅延最大=%d ms\n"
+            "直近1秒: クロック最大ずれ=%ld µs  完了遅延最大=%d ms  録音余裕最小=%s  出力余裕最小=%s\n"
+            "イベントログ: " A8DJ_EVENT_LOG "\n"
             "MIDI in=%u バイト out=%u バイト  EP1受信=%u パケット(ACK %u) 読み出し%s 取りこぼし%u\n"
             "MIDI ポート: %s\n",
             A8DJ_UsbStatus(), g.rate,
@@ -326,6 +399,8 @@ static void PublishStatus(void)
             g.outStarve, g.startStarve, g.outMarginMin, g.driftFix,
             g.inStarve, g.inMarginMin, g.inLostFrames,
             g.clockErrMaxUs, g.clockResets,
+            g.resyncsIn, g.resyncsOut, g.cbLateMaxMs,
+            (long)gSecClockErrUs, (int)gSecCbLateMs, secIn, secOut,
             g.midiIn, g.midiOut,
             g.midiPkts, g.midiAcks, g.midiPosted ? "あり" : "なし", g.midiLost,
             A8DJ_MidiStatus());
@@ -793,6 +868,11 @@ static double BusFrameHostTime(UInt64 frame)
     if (g.intf && (*g.intf)->GetBusFrameNumber &&
         (*g.intf)->GetBusFrameNumber(g.intf, &f, &at) == KERN_SUCCESS &&
         f >= frame && f - frame < 1000) {
+        // How long after its last bus frame this completion ran. It is the
+        // slack the queue has to absorb; a resync means it ran out.
+        int late = (int)(f - frame);
+        AtomicMaxInt(&g.cbLateWinMs, late);
+        AtomicMaxInt(&g.cbLateMaxMs, late);
         uint64_t t = ((uint64_t)at.hi << 32) | at.lo;
         return (double)t - (double)(f - frame) * (TicksPerSecond() / 1000.0);
     }
@@ -826,12 +906,21 @@ static uint64_t ClockObserve(uint64_t pos, double t)
     // Start over from the new observation rather than slew for seconds.
     if (errUs > 20000.0) {
         g.clockResets++;
+        PushEvent(EV_CLOCK_RESET, (int)(e / ticksPerUs / 1000.0), 0, 0);
         g.dllPos = pos;
         g.dllTime = t;
         return (uint64_t)llround(t);
     }
-    if (pos > (uint64_t)g.rate && errUs > (double)g.clockErrMaxUs)
-        g.clockErrMaxUs = (long)errUs;
+    if (pos > (uint64_t)g.rate) {
+        if (errUs > (double)g.clockErrMaxUs) g.clockErrMaxUs = (long)errUs;
+        AtomicMaxLong(&g.clockErrWinUs, (long)errUs);
+        // Signed: positive means the frames completed later than the line.
+        uint64_t now = mach_absolute_time();
+        if (errUs > 500.0 && now - g.lastSpikeHost > (uint64_t)(TicksPerSecond() / 10)) {
+            g.lastSpikeHost = now;
+            PushEvent(EV_CLOCK_SPIKE, (int)(e / ticksPerUs), (int)(pos % 1000000000), now);
+        }
+    }
 
     // One late reading must not drag the line: clip what the loop sees.
     double clip = 1000.0 * ticksPerUs;
@@ -900,9 +989,14 @@ static int SubmitIn(int idx)
         UInt64 now = BusFrameNow();
         if (!now) { g.submitFails++; return 0; }
         UInt64 restart = now + RESYNC_FRAMES;
-        g.pendingInGapUframes += GapUframes(g.nextIn, restart);
+        unsigned gap = GapUframes(g.nextIn, restart);
+        g.pendingInGapUframes += gap;
+        // a: how far the bus had already passed the planned frame (ms);
+        // b: the gap the device sees, in microframes.
+        PushEvent(EV_RESYNC_IN, (int)((int64_t)now - (int64_t)g.nextIn), (int)gap, 0);
         g.nextIn = restart;
         g.resyncs++;
+        g.resyncsIn++;
         r = (*g.intf)->ReadIsochPipeAsync(g.intf, g.pipeIsoIn, g.inBuf[idx], g.nextIn,
                                           XFER_UFRAMES, g.inList[idx],
                                           XferComplete, &g.inRef[idx]);
@@ -1006,6 +1100,7 @@ static int SubmitOut(int idx)
             // number that matters, which is the worst case once running.
             if (g.deviceFrames > (uint64_t)g.rate) {
                 if (margin < g.outMarginMin) g.outMarginMin = margin;
+                AtomicMinLong(&g.outMarginWin, margin);
                 if (!ready) g.outStarve++;
             } else if (!ready) {
                 g.startStarve++;
@@ -1049,9 +1144,12 @@ static int SubmitOut(int idx)
         UInt64 restart = now + RESYNC_FRAMES;
         // This buffer is already built; the frames it pushed later are made
         // up by skipping ahead in the ones after it.
-        g.pendingOutGapUframes += GapUframes(g.nextOut, restart);
+        unsigned gap = GapUframes(g.nextOut, restart);
+        g.pendingOutGapUframes += gap;
+        PushEvent(EV_RESYNC_OUT, (int)((int64_t)now - (int64_t)g.nextOut), (int)gap, 0);
         g.nextOut = restart;
         g.resyncs++;
+        g.resyncsOut++;
         r = (*g.intf)->WriteIsochPipeAsync(g.intf, g.pipeIsoOut, buf, g.nextOut,
                                            XFER_UFRAMES, g.outList[idx],
                                            XferComplete, &g.outRef[idx]);
@@ -1074,6 +1172,8 @@ static void RearmAll(void)
     UInt64 restart = now + RESYNC_FRAMES;
     g.pendingInGapUframes  += GapUframes(g.nextIn, restart);
     g.pendingOutGapUframes += GapUframes(g.nextOut, restart);
+    PushEvent(EV_REARM, (int)((int64_t)now - (int64_t)g.nextIn),
+              (int)((int64_t)now - (int64_t)g.nextOut), 0);
     g.nextIn = g.nextOut = restart;
     g.rearms++;
     for (int i = 0; i < NBUF; i++) SubmitIn(i);
@@ -1290,6 +1390,95 @@ static void WatchdogFired(CFRunLoopTimerRef timer, void *info)
 
 // The streaming thread runs under a time-constraint policy, so it must not do
 // file IO. This one publishes the counters instead, once a second.
+typedef struct {
+    unsigned resyncIn, resyncOut, rearms, inStarve, outStarve, lost;
+    unsigned frErrIn, frErrOut, xferErrIn, xferErrOut, clockResets;
+} CounterSnapshot;
+
+static CounterSnapshot TakeSnapshot(void)
+{
+    return (CounterSnapshot){
+        g.resyncsIn, g.resyncsOut, g.rearms, g.inStarve, g.outStarve, g.inLostFrames,
+        g.frErrIn, g.frErrOut, g.xferErrIn, g.xferErrOut, g.clockResets };
+}
+
+static double SessionSeconds(uint64_t host)
+{
+    if (!g.sessionHost || host < g.sessionHost) return 0;
+    return (double)(host - g.sessionHost) / TicksPerSecond();
+}
+
+// One second of diagnostics: drain the event ring into the log, then write a
+// summary line if anything happened. Lines carry wall-clock time for lining
+// up with what was heard, and stream time (t=) for lining up with each other.
+static void MonitorTick(FILE *log, CounterSnapshot *prev)
+{
+    long errWin  = atomic_exchange(&g.clockErrWinUs, 0);
+    int  lateWin = atomic_exchange(&g.cbLateWinMs, 0);
+    long inWin   = atomic_exchange(&g.inMarginWin, 1L << 30);
+    long outWin  = atomic_exchange(&g.outMarginWin, 1L << 30);
+    gSecClockErrUs = errWin;
+    gSecCbLateMs   = lateWin;
+    gSecInMargin   = inWin;
+    gSecOutMargin  = outWin;
+    if (!log) { *prev = TakeSnapshot(); g.evTail = g.evHead; return; }
+
+    char wall[16];
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(wall, sizeof(wall), "%H:%M:%S", &tmv);
+
+    unsigned head = atomic_load_explicit(&g.evHead, memory_order_acquire);
+    if (head - g.evTail > EVENT_RING) {
+        fprintf(log, "[%s] イベント %u 件を取りこぼし\n", wall, head - g.evTail - EVENT_RING);
+        g.evTail = head - EVENT_RING;
+    }
+    for (; g.evTail != head; g.evTail++) {
+        unsigned i = g.evTail % EVENT_RING;
+        double t = SessionSeconds(g.events[i].host);
+        int a = g.events[i].a, b = g.events[i].b;
+        switch (g.events[i].kind) {
+        case EV_RESYNC_IN:
+        case EV_RESYNC_OUT:
+            fprintf(log, "[%s t=%.3fs] resync %s: 予定フレームを %d ms 過ぎていた  欠落 %.3f ms\n",
+                    wall, t, g.events[i].kind == EV_RESYNC_IN ? "IN " : "OUT", a, b / 8.0);
+            break;
+        case EV_REARM:
+            fprintf(log, "[%s t=%.3fs] rearm: 全転送が停止  IN %d ms / OUT %d ms 遅れ\n", wall, t, a, b);
+            break;
+        case EV_CLOCK_RESET:
+            fprintf(log, "[%s t=%.3fs] クロックフィルタ再始動: ずれ %+d ms\n", wall, t, a);
+            break;
+        case EV_CLOCK_SPIKE:
+            fprintf(log, "[%s t=%.3fs] クロックずれ %+d µs (到着が線より%s)\n",
+                    wall, t, a, a > 0 ? "遅い" : "早い");
+            break;
+        default:
+            break;
+        }
+    }
+
+    CounterSnapshot cur = TakeSnapshot();
+    int changed = memcmp(&cur, prev, sizeof(cur)) != 0;
+    if (changed || errWin > 500) {
+        char inM[24], outM[24];
+        FormatMargin(inM, sizeof(inM), inWin);
+        FormatMargin(outM, sizeof(outM), outWin);
+        fprintf(log, "[%s t=%.0fs] 1秒集計: resync IN+%u OUT+%u rearm+%u | 録音先読み+%u (最小余裕 %s) | "
+                     "出力枯渇+%u (最小余裕 %s) | 欠落補完+%u | µframe異常 in+%u out+%u | "
+                     "転送失敗 in+%u out+%u | フィルタ再始動+%u | クロック最大ずれ %ld µs | 完了遅延最大 %d ms\n",
+                wall, SessionSeconds(mach_absolute_time()),
+                cur.resyncIn - prev->resyncIn, cur.resyncOut - prev->resyncOut, cur.rearms - prev->rearms,
+                cur.inStarve - prev->inStarve, inM, cur.outStarve - prev->outStarve, outM,
+                cur.lost - prev->lost, cur.frErrIn - prev->frErrIn, cur.frErrOut - prev->frErrOut,
+                cur.xferErrIn - prev->xferErrIn, cur.xferErrOut - prev->xferErrOut,
+                cur.clockResets - prev->clockResets, errWin, lateWin);
+    }
+    *prev = cur;
+    fflush(log);
+}
+
 static void *MonitorThread(void *arg)
 {
     (void)arg;
@@ -1300,12 +1489,33 @@ static void *MonitorThread(void *arg)
     thread_policy_set(pthread_mach_thread_np(pthread_self()),
                       THREAD_STANDARD_POLICY, (thread_policy_t)&std,
                       THREAD_STANDARD_POLICY_COUNT);
+    FILE *log = A8DJ_LOG_OPEN(A8DJ_EVENT_LOG, 1 << 20);
+    if (log) {
+        char wall[32];
+        time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        strftime(wall, sizeof(wall), "%Y-%m-%d %H:%M:%S", &tmv);
+        fprintf(log, "=== %s 開始 %d Hz  uframes=%d nbuf=%d  lead=%u フレーム  "
+                     "セーフティ in=%u out=%u ===\n",
+                wall, g.rate, gUframes, gNbuf, g.leadFrames,
+                A8DJ_UsbSafetyOffsetFrames(g.rate, 1), A8DJ_UsbSafetyOffsetFrames(g.rate, 0));
+        fflush(log);
+    }
+    CounterSnapshot prev = TakeSnapshot();
     while (g.running) {
         A8DJ_MidiInit();          // no-op once the ports exist
         PublishStatus();
         // Short naps so A8DJ_UsbStop, which joins this thread, is not held up
         // for the best part of a second inside StopIO.
         for (int i = 0; i < 20 && g.running; i++) usleep(50 * 1000);
+        MonitorTick(log, &prev);
+    }
+    if (log) {
+        fprintf(log, "=== 停止 t=%.0fs  resync IN=%u OUT=%u  クロック最大ずれ %ld µs  完了遅延最大 %d ms ===\n",
+                SessionSeconds(mach_absolute_time()), g.resyncsIn, g.resyncsOut,
+                g.clockErrMaxUs, g.cbLateMaxMs);
+        fclose(log);
     }
     return NULL;
 }
@@ -1351,7 +1561,8 @@ static void *StreamThread(void *arg)
     }
     g.running = 1;
     pthread_mutex_unlock(&g.startMutex);
-    PublishClock(0, mach_absolute_time(), 1);
+    g.sessionHost    = mach_absolute_time();
+    PublishClock(0, g.sessionHost, 1);
     g.outFrames      = 0;
     g.outBytePos     = OUT_START_PHASE;
     g.uframeCursor   = 0;
@@ -1577,6 +1788,13 @@ static void ResetSession(void)
     g.dllPrimed      = 0;
     g.clockErrMaxUs  = 0;
     g.clockResets    = 0;
+    g.resyncsIn = g.resyncsOut = 0;
+    g.clockErrWinUs  = 0;
+    g.cbLateWinMs = g.cbLateMaxMs = 0;
+    g.inMarginWin = g.outMarginWin = 1L << 30;
+    g.sessionHost = g.lastSpikeHost = 0;
+    g.evHead = 0;
+    g.evTail = 0;
     for (int i = 0; i < NBUF_MAX; i++) g.inRef[i].gapUframes = 0;
 }
 
@@ -1709,6 +1927,7 @@ void A8DJ_UsbReadCapture(Float32 *outBuf, uint64_t inStartFrame, uint32_t inFram
         long margin = have >= inStartFrame && have - inStartFrame <= LONG_MAX
             ? (long)(have - inStartFrame) - (long)inFrames : -LONG_MAX;
         if (margin < g.inMarginMin) g.inMarginMin = margin;
+        AtomicMinLong(&g.inMarginWin, margin);
         if (margin < 0) g.inStarve++;
     }
     // Frames past `have` have not arrived. Their slots still hold the previous

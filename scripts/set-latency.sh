@@ -51,6 +51,9 @@ show)
     echo
     echo "実行中の状態 (/tmp/a8dj-status.txt):"
     [ -f /tmp/a8dj-status.txt ] && cat /tmp/a8dj-status.txt || echo "  (未起動)"
+    echo
+    echo "イベントログ末尾 (/tmp/a8dj-events.log):"
+    [ -f /tmp/a8dj-events.log ] && tail -n 20 /tmp/a8dj-events.log || echo "  (なし)"
     exit 0
     ;;
 *) usage; exit 1 ;;

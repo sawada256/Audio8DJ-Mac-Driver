@@ -56,3 +56,9 @@ Use `bash scripts/set-latency.sh safe` (default), `mid`, or `low`. The profile i
 
 Set `hw_latency_*` from a loopback measurement; the queue lead is already part of the safety offset and must not be added here. While reducing margins, watch the capture-starve, output-starve and clock-error lines in `/tmp/a8dj-status.txt`.
 
+### 診断ログ / Diagnostics log
+
+ストリーミング中は `/tmp/a8dj-events.log` に追記します（1 MB を超えると最初から）。resync（IN/OUT 別、予定フレームをどれだけ過ぎていたか、欠落時間）、rearm、クロックの 500 µs 超のずれ、フィルタ再始動を発生時刻つきで記録し、何か起きた秒には1秒集計（録音先読み・出力枯渇・最小余裕・欠落補完・クロック最大ずれ・完了遅延最大）を書きます。`t=` は再生開始からの秒数です。状態ファイルには直近1秒の値と resync の内訳が出ます。
+
+While streaming, `/tmp/a8dj-events.log` records resyncs (per direction, how far past the planned frame, gap length), rearms, clock deviations over 500 µs and filter restarts, plus a one-second summary for any second in which something happened. `t=` is seconds since streaming started. The status file shows the last second's values and the resync split. `bash scripts/set-latency.sh show` prints both.
+
