@@ -43,6 +43,13 @@ void A8DJ_UsbWritePlayback(const Float32 *inBuf, uint64_t inStartFrame, uint32_t
 uint32_t A8DJ_UsbOutputLeadFrames(double inRate);
 uint32_t A8DJ_UsbTransferFrames(double inRate);
 
+// kAudioDevicePropertySafetyOffset: how close to "now" CoreAudio may read
+// (input) or write (output). Includes the queue lead and configured margins.
+uint32_t A8DJ_UsbSafetyOffsetFrames(double inRate, int isInput);
+// kAudioDevicePropertyLatency: delay outside the published timeline
+// (converters, device FIFO). Never includes the queue lead.
+uint32_t A8DJ_UsbDeviceLatencyFrames(double inRate, int isInput);
+
 // Short human-readable state, surfaced through the device name while bringing
 // the driver up.
 const char *A8DJ_UsbStatus(void);

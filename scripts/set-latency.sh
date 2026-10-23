@@ -26,10 +26,21 @@ DAW buffer size is separate. Use safe if you encounter dropouts.
 EOF
 }
 
+# Replace only the preset line; margins and measured hardware latencies
+# (in_margin_us, hw_latency_out_us, ...) stay as they were.
+write_preset() {
+    local tmp
+    tmp=$(mktemp)
+    if [ -f "$CONF" ]; then
+        grep -v -E '^[[:space:]]*(preset|uframes|nbuf)[[:space:]]*=' "$CONF" > "$tmp" || true
+    fi
+    echo "preset=$1" >> "$tmp"
+    cat "$tmp" > "$CONF"
+    rm -f "$tmp"
+}
+
 case "${1:-}" in
-safe) echo "preset=safe" > "$CONF" ;;
-mid)  echo "preset=mid"  > "$CONF" ;;
-low)  echo "preset=low"  > "$CONF" ;;
+safe|mid|low) write_preset "$1" ;;
 show)
     if [ -f "$CONF" ]; then
         echo "設定ファイル $CONF:"

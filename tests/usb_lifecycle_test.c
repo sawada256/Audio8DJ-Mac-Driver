@@ -110,7 +110,7 @@ static void TestIsoOwnership(void)
         g.inBuf[i] = calloc(XFER_UFRAMES_MAX, ISO_MAXPKT);
         g.outBuf[i] = calloc(XFER_UFRAMES_MAX, ISO_MAXPKT);
         assert(g.inList[i] && g.outList[i] && g.inBuf[i] && g.outBuf[i]);
-        g.inRef[i] = (XferRef){i, 1, 0}; g.outRef[i] = (XferRef){i, 0, 0};
+        g.inRef[i] = (XferRef){i, 1, 0, 0, 0}; g.outRef[i] = (XferRef){i, 0, 0, 0, 0};
     }
     assert(SubmitIn(0) == 1 && SubmitIn(0) == 0 && isoReads == 1);
     assert(SubmitOut(0) == 1 && SubmitOut(0) == 0 && isoWrites == 1);
@@ -123,7 +123,8 @@ static void TestIsoOwnership(void)
     g.inList[0][0].frActCount = UINT16_MAX;
     g.inList[0][0].frStatus = kIOReturnSuccess;
     XferComplete(&g.inRef[0], kIOReturnSuccess, NULL);
-    assert(g.frErrIn == 1 && g.deviceFrames == 0);
+    // A corrupt packet still took a microframe of device time: 6 frames at 48 kHz.
+    assert(g.frErrIn == 1 && g.deviceFrames == 6 && g.inLostFrames == 6);
     assert(g.inflight == 2 * NBUF); // completed slot was requeued exactly once
     g.running = 0;
     for (int i = 0; i < NBUF; i++) {
@@ -216,6 +217,125 @@ static void TestAudioAndClock(void)
     g.captureSlots = g.playbackSlots = NULL;
 }
 
+// Lost IN time must advance the clock, and a resync gap must be accounted
+// before the transfer that follows it, on both directions.
+static void TestLossAndGaps(void)
+{
+    IOUSBInterfaceInterface182 table = { .ReadIsochPipeAsync = FakeIso, .WriteIsochPipeAsync = FakeIso };
+    IOUSBInterfaceInterface182 *pointer = &table;
+    g.intf = &pointer;
+    ResetSession();
+    g.running = 1;
+    g.rate = 44100;
+    for (int i = 0; i < NBUF; i++) {
+        g.inList[i] = calloc(XFER_UFRAMES_MAX, sizeof(IOUSBIsocFrame));
+        g.outList[i] = calloc(XFER_UFRAMES_MAX, sizeof(IOUSBIsocFrame));
+        g.inBuf[i] = calloc(XFER_UFRAMES_MAX, ISO_MAXPKT);
+        g.outBuf[i] = calloc(XFER_UFRAMES_MAX, ISO_MAXPKT);
+        g.inRef[i] = (XferRef){i, 1, 0, 0, 0}; g.outRef[i] = (XferRef){i, 0, 0, 0, 0};
+    }
+    // A whole failed transfer: XFER_UFRAMES microframes at 44.1 kHz, with
+    // the fractional carry exact over many transfers.
+    assert(SubmitIn(0) == 1);
+    for (int k = 0; k < 80; k++) {                 // each completion requeues itself
+        XferComplete(&g.inRef[0], kIOReturnNotResponding, NULL);
+        assert(g.inRef[0].pending);
+    }
+    uint64_t expect = (uint64_t)(80.0 * XFER_UFRAMES * 44100.0 / 8000.0);
+    assert(g.deviceFrames == expect || g.deviceFrames + 1 == expect);
+    // A rearm after a 3 ms gap: IN carries it into the next completion,
+    // OUT skips the frames that would have played in it.
+    g.nextIn = g.nextOut = 1000;
+    g.pendingInGapUframes += GapUframes(g.nextIn, 1003);
+    g.pendingOutGapUframes += GapUframes(g.nextOut, 1003);
+    assert(g.pendingInGapUframes == 24 && g.pendingOutGapUframes == 24);
+    uint64_t before = g.deviceFrames;
+    assert(SubmitIn(1) == 1 && g.inRef[1].gapUframes == 24 && g.pendingInGapUframes == 0);
+    XferComplete(&g.inRef[1], kIOReturnSuccess, NULL); // all microframes empty
+    assert(g.deviceFrames - before == 132 || g.deviceFrames - before == 133);
+    uint64_t outBefore = g.outFrames;
+    assert(SubmitOut(1) == 1 && g.pendingOutGapUframes == 0);
+    assert(g.outFrames - outBefore == 132 + (uint64_t)(XFER_UFRAMES * 44100 / 8000) ||
+           g.outFrames - outBefore == 133 + (uint64_t)(XFER_UFRAMES * 44100 / 8000) ||
+           g.outFrames - outBefore == 132 + (uint64_t)(XFER_UFRAMES * 44100 / 8000) + 1);
+    g.running = 0;
+    for (int i = 0; i < NBUF; i++) {
+        XferComplete(&g.inRef[i], kIOReturnAborted, NULL);
+        XferComplete(&g.outRef[i], kIOReturnAborted, NULL);
+        free(g.inList[i]); free(g.outList[i]); free(g.inBuf[i]); free(g.outBuf[i]);
+        g.inList[i] = g.outList[i] = NULL;
+        g.inBuf[i] = g.outBuf[i] = NULL;
+    }
+    g.intf = NULL;
+    ResetSession();
+}
+
+// The clock filter must recover a straight line from jittered arrivals,
+// including a device crystal 50 ppm off nominal.
+static void TestClockFilter(void)
+{
+    ResetSession();
+    g.rate = 48000;
+    double tpf = TicksPerSecond() / 48000.0 * (1.0 + 50e-6);
+    double ticksPerUs = TicksPerSecond() / 1e6;
+    uint32_t rng = 12345;
+    double worst = 0;
+    for (int k = 1; k <= 5000; k++) {             // 10 s of 2 ms transfers
+        uint64_t pos = (uint64_t)k * 96;
+        rng = rng * 1664525u + 1013904223u;
+        double jitter = ((double)(rng >> 8) / (double)(1u << 24)) * 1000.0 * ticksPerUs; // 0..1 ms late
+        double truth = 1e9 + (double)pos * tpf;
+        uint64_t host = ClockObserve(pos, truth + jitter);
+        if (k > 2500) {
+            double err = fabs((double)host - (truth + 500.0 * ticksPerUs)) / ticksPerUs;
+            if (err > worst) worst = err;
+        }
+    }
+    // Raw arrivals wander over 1000 us; the filtered line stays within a
+    // small fraction of that around their mean.
+    assert(worst < 150.0);
+    assert(fabs(g.dllTicksPerFrame / tpf - 1.0) < 20e-6);
+    // A multi-second stall restarts the filter instead of slewing.
+    uint64_t pos = 5001 * 96;
+    ClockObserve(pos, 1e9 + (double)pos * tpf + 5e5 * ticksPerUs);
+    assert(g.clockResets == 1);
+    ResetSession();
+}
+
+// Reading past the newest frame gives silence, never a held copy of it.
+static void TestCaptureBeyondHave(void)
+{
+    g.capture = calloc(RING_FRAMES * A8DJ_CHANNELS, sizeof(Float32));
+    g.captureSlots = calloc(RING_FRAMES, sizeof(A8DJ_RingSlot));
+    for (size_t i = 0; i < RING_FRAMES; i++) atomic_flag_clear(&g.captureSlots[i].busy);
+    g.rate = 48000;
+    g.running = 1;
+    PublishClock(0, 100, 1);
+    uint8_t wire[32 * 4];
+    Float32 src[5][A8DJ_CHANNELS];
+    for (int j = 0; j < 5; j++) for (int c = 0; c < A8DJ_CHANNELS; c++) src[j][c] = .25f;
+    EncodeStream(wire, sizeof(wire), 0, src);
+    DecodeFrames(wire, 4, 0);
+    PublishClock(4, 200, 0);
+    Float32 out[8][A8DJ_CHANNELS];
+    A8DJ_UsbReadCapture(&out[0][0], 0, 8);
+    for (int f = 0; f < 4; f++) assert(out[f][3] == .25f);
+    for (int f = 4; f < 8; f++) for (int c = 0; c < A8DJ_CHANNELS; c++) assert(out[f][c] == 0);
+    g.running = 0;
+    free(g.capture); free(g.captureSlots);
+    g.capture = NULL; g.captureSlots = NULL;
+}
+
+// Output conversion is bit-exact for 24-bit sources and clips cleanly.
+static void TestConversion(void)
+{
+    for (int32_t v = -8388608; v <= 8388607; v += 4099)
+        assert(A8DJ_FloatToS24(A8DJ_S24ToFloat(v)) == v);
+    assert(A8DJ_FloatToS24(A8DJ_S24ToFloat(8388607)) == 8388607);
+    assert(A8DJ_FloatToS24(2.0f) == 8388607 && A8DJ_FloatToS24(-2.0f) == -8388608);
+    assert(A8DJ_FloatToS24(NAN) == 0 && A8DJ_FloatToS24(INFINITY) == 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--probe") == 0) {
@@ -244,5 +364,9 @@ int main(int argc, char **argv)
     TestMidiOwnership();
     TestIsoOwnership();
     TestAudioAndClock();
-    puts("PASS: startup cancellation, stale/quarantined buffers, MIDI ownership, audio bounds and coherent clock");
+    TestLossAndGaps();
+    TestClockFilter();
+    TestCaptureBeyondHave();
+    TestConversion();
+    puts("PASS: startup cancellation, stale/quarantined buffers, MIDI ownership, audio bounds, coherent clock, IN loss/gaps, clock filter, capture past end, conversion");
 }

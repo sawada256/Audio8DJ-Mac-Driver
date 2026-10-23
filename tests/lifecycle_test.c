@@ -11,6 +11,7 @@ static UInt64 requestedRate;
 static int clockAvailable;
 static uint64_t clockFrames, clockHost, clockSeed;
 static int captures, playbacks;
+static int restartAllowed; // a rate change restarts USB under running clients
 static UInt32 Scalar(AudioObjectID object, AudioObjectPropertySelector selector)
 {
     AudioObjectPropertyAddress a = { selector, kAudioObjectPropertyScopeGlobal, 0 };
@@ -52,7 +53,7 @@ void A8DJ_UsbStop(void)
     // USB teardown can be slow: properties/clock state must remain accessible.
     assert(pthread_mutex_trylock(&gStateMutex) == 0);
     pthread_mutex_unlock(&gStateMutex);
-    assert(Scalar(kObjectID_Device, kAudioDevicePropertyDeviceIsRunning) == 0);
+    if (!restartAllowed) assert(Scalar(kObjectID_Device, kAudioDevicePropertyDeviceIsRunning) == 0);
     stops++;
 }
 int A8DJ_UsbGetClock(uint64_t *f, uint64_t *t, uint64_t *s)
@@ -61,6 +62,9 @@ void A8DJ_UsbReadCapture(Float32 *b, uint64_t f, uint32_t n) { (void)b; (void)f;
 void A8DJ_UsbWritePlayback(const Float32 *b, uint64_t f, uint32_t n) { (void)b; (void)f; (void)n; playbacks++; }
 uint32_t A8DJ_UsbOutputLeadFrames(double r) { return (uint32_t)(r * .008); }
 uint32_t A8DJ_UsbTransferFrames(double r) { return (uint32_t)(r * .002); }
+uint32_t A8DJ_UsbSafetyOffsetFrames(double r, int in) { return in ? 2 * A8DJ_UsbTransferFrames(r)
+    : A8DJ_UsbOutputLeadFrames(r) + A8DJ_UsbTransferFrames(r); }
+uint32_t A8DJ_UsbDeviceLatencyFrames(double r, int in) { return (uint32_t)(r * (in ? .0005 : .001)); }
 const char *A8DJ_UsbStatus(void) { return "test"; }
 
 static void CheckPresence(Boolean present)
@@ -214,6 +218,34 @@ int main(void)
     assert(gSampleRate == 96000);
     assert(Audio8DJ_PerformDeviceConfigurationChange(gDriverRef, kObjectID_Device, 192000, NULL) != 0);
     assert(gSampleRate == 96000);
+    // A rate change while a client runs restarts USB at the new rate rather
+    // than refusing (the host need not stop IO first).
+    assert(Audio8DJ_StartIO(gDriverRef, kObjectID_Device, 20) == 0);
+    int stopsBefore = stops, startsBefore = starts;
+    restartAllowed = 1;
+    assert(Audio8DJ_PerformDeviceConfigurationChange(gDriverRef, kObjectID_Device, 44100, NULL) == 0);
+    assert(gSampleRate == 44100 && stops == stopsBefore + 1 && starts == startsBefore + 1);
+    assert(gIORunningCount == 1);
+    startFailure = 1;
+    assert(Audio8DJ_PerformDeviceConfigurationChange(gDriverRef, kObjectID_Device, 96000, NULL) != 0);
+    startFailure = 0;
+    restartAllowed = 0;
+    Audio8DJ_StopIO(gDriverRef, kObjectID_Device, 20);
+    assert(gSampleRate == 96000);
+    // Latency must not repeat the queue lead that the safety offset carries.
+    AudioObjectPropertyAddress lat = { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, 0 };
+    UInt32 v, sz = sizeof(v);
+    assert(Audio8DJ_GetPropertyData(gDriverRef, kObjectID_Device, 0, &lat, 0, NULL, sizeof(v), &sz, &v) == 0);
+    assert(v == A8DJ_UsbDeviceLatencyFrames(96000, 0));
+    lat.mScope = kAudioObjectPropertyScopeInput;
+    assert(Audio8DJ_GetPropertyData(gDriverRef, kObjectID_Device, 0, &lat, 0, NULL, sizeof(v), &sz, &v) == 0);
+    assert(v == A8DJ_UsbDeviceLatencyFrames(96000, 1));
+    lat.mSelector = kAudioDevicePropertySafetyOffset;
+    assert(Audio8DJ_GetPropertyData(gDriverRef, kObjectID_Device, 0, &lat, 0, NULL, sizeof(v), &sz, &v) == 0);
+    assert(v == A8DJ_UsbSafetyOffsetFrames(96000, 1));
+    lat.mScope = kAudioObjectPropertyScopeOutput;
+    assert(Audio8DJ_GetPropertyData(gDriverRef, kObjectID_Device, 0, &lat, 0, NULL, sizeof(v), &sz, &v) == 0);
+    assert(v == A8DJ_UsbSafetyOffsetFrames(96000, 0));
     for (int i = 0; i < 1000; i++) {
         assert(Audio8DJ_StartIO(gDriverRef, kObjectID_Device, 20) == 0);
         Audio8DJ_StopIO(gDriverRef, kObjectID_Device, 20);

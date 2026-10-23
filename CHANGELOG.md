@@ -1,5 +1,23 @@
 # Changelog / 変更履歴
 
+## [Unreleased]
+
+- 出力レイテンシの報告で USB キューの lead を二重に数えていた問題を修正。機器側レイテンシは設定キー `hw_latency_in_us` / `hw_latency_out_us` で報告します。
+- IN パケットの欠落・再スケジュール時に公開クロックが実時間から遅れ、ドリフト補正が機器の出力 FIFO を枯渇させていた問題を修正。欠落区間は時間を進めて無音にします。OUT 側も再スケジュール分を読み飛ばして整列を保ちます。
+- クロックを USB バスフレーム時刻と DLL（遅延ロックループ）で平滑化し、コールバックの揺らぎが zero timestamp に乗らないようにしました。
+- 録音で未到着フレームを読んだ際に直前のサンプルを繰り返していた問題を修正（無音を返す）。
+- 再生中のサンプルレート変更を拒否せず、USB を新レートで再起動するようにしました。
+- 出力の float→24bit 変換を 2^23 基準の丸めに変更し、24bit 音源をビット単位で再現するようにしました。サンプル変換は1回だけ行います。
+- 余裕を調整する設定キー `in_margin_us` / `out_margin_us` を追加。`set-latency.sh` は preset 以外の設定を保持します。
+
+- Output latency no longer counts the USB queue lead twice; device latency is reported from `hw_latency_in_us` / `hw_latency_out_us`.
+- Lost or rescheduled IN packets now advance the clock (as silence) instead of shifting it, which had made drift correction starve the device's output FIFO; OUT skips the same gap.
+- Clock is filtered with bus-frame time and a delay-locked loop, keeping callback jitter out of zero timestamps.
+- Late capture reads return silence instead of repeating the newest sample.
+- Sample-rate changes while running restart USB at the new rate instead of failing.
+- Float to 24-bit output uses 2^23 scaling with rounding (bit-exact for 24-bit sources).
+- New `in_margin_us` / `out_margin_us` keys; `set-latency.sh` keeps non-preset settings.
+
 ## [0.1.0] - 2026-09-13
 
 初期リリース。Audio 8 DJの8入力・8出力、USB接続監視、MIDIブリッジ、内蔵ファームウェア、Universalビルド、ZIP/pkgインストーラー、日本語・英語の利用ガイドを提供します。

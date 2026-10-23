@@ -40,3 +40,19 @@ The per-user MIDI agent creates CoreMIDI ports and exchanges bytes with the HAL 
 `bash scripts/set-latency.sh safe`（標準）, `mid`, `low`。設定は `/Users/Shared/audio8dj.conf` に保存され、反映時に音声が中断します。`safe` から始め、USB負荷に応じて調整してください。DAWのバッファ設定は別項目です。
 
 Use `bash scripts/set-latency.sh safe` (default), `mid`, or `low`. The profile is stored in `/Users/Shared/audio8dj.conf`; applying it interrupts audio. Start with safe and adjust for USB load. The DAW's buffer size is a separate setting.
+
+### 詳細設定 / Fine tuning
+
+`/Users/Shared/audio8dj.conf` には次のキーも書けます（値はマイクロ秒、`set-latency.sh` で preset を切り替えても保持されます）。反映には coreaudiod の再起動が必要です。
+
+| キー / Key | 既定 / Default | 内容 / Meaning |
+|---|---|---|
+| `in_margin_us` | 1転送分 / one transfer | 入力セーフティオフセットの余裕（1転送分に加算）/ Input slack on top of one transfer |
+| `out_margin_us` | 0 | 出力セーフティオフセットの余裕（lead + 1転送分に加算）/ Output slack on top of lead + one transfer |
+| `hw_latency_in_us` | 0 | アプリへ報告する入力側の機器レイテンシ（ADC等）/ Input converter/device latency reported to apps |
+| `hw_latency_out_us` | 0 | 同、出力側（DAC・機器内FIFO）/ Same, output side |
+
+`hw_latency_*` はループバック実測で決めます。キューの lead はセーフティオフセットに含まれるため、ここには入れません。状態ファイル `/tmp/a8dj-status.txt` の「録音先読み」「出力枯渇」「クロック: 最大ずれ」が余裕を詰める際の指標です。
+
+Set `hw_latency_*` from a loopback measurement; the queue lead is already part of the safety offset and must not be added here. While reducing margins, watch the capture-starve, output-starve and clock-error lines in `/tmp/a8dj-status.txt`.
+

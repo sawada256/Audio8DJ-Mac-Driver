@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include "../plugin/sample_convert.h"
 typedef float Float32;
 #define A8DJ_CHANNELS 8
 #define WIRE_STREAMS 4
@@ -14,9 +15,7 @@ static void Encode(uint8_t *fr,const Float32 *src){
         uint8_t *b=fr+blk*16;
         for(int s=0;s<WIRE_STREAMS;s++) b[s]=CheckByte(s,blk);
         for(int s=0;s<WIRE_STREAMS;s++){
-            Float32 x=src[WireChannel(s,blk)];
-            if(x>1.0f)x=1.0f; if(x<-1.0f)x=-1.0f;
-            int32_t v=(int32_t)(x*8388607.0f);
+            int32_t v=A8DJ_FloatToS24(src[WireChannel(s,blk)]);
             b[4+s]=(uint8_t)(v>>16); b[8+s]=(uint8_t)(v>>8); b[12+s]=(uint8_t)v;
         }
     }
