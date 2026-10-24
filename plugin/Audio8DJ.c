@@ -109,9 +109,35 @@ static void NotifyPresence(void)
     }
 }
 
+// Configuration-change action meaning "latency/safety offsets changed".
+// Sample rates are the other actions; no supported rate can be 1.
+#define kChangeActionTiming 1
+
+// The latency config changed between sessions. coreaudiod caches the safety
+// offsets: measured, a plain PropertiesChanged left it on the old values
+// while the engine ran with the new ones. A configuration change makes the
+// host re-read the device, which is how it is meant to learn of this.
+static void RequestTimingChange(void *unused)
+{
+    (void)unused;
+    if (!gHost) return;
+    gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, kChangeActionTiming, NULL);
+    AudioObjectPropertyAddress a[4] = {
+        { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain },
+    };
+    gHost->PropertiesChanged(gHost, kObjectID_Device, 4, a);
+}
+
 static void RefreshPresence(void)
 {
     pthread_mutex_lock(&gIOMutex);
+    if (gIORunningCount == 0 && A8DJ_UsbReloadConfig()) {
+        os_log(OS_LOG_DEFAULT, "Audio8DJ: latency config reloaded");
+        if (gNotifyQueue) dispatch_async_f(gNotifyQueue, NULL, RequestTimingChange);
+    }
     uint64_t identity = A8DJ_UsbPollDevice();
     if (identity == gRegistryID) { pthread_mutex_unlock(&gIOMutex); return; }
     if (gRegistryID) {
@@ -368,15 +394,21 @@ static OSStatus Audio8DJ_PerformDeviceConfigurationChange(AudioServerPlugInDrive
     if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
     if (inDeviceObjectID != kObjectID_Device) return kAudioHardwareBadObjectError;
 
+    // Nothing to do here: the values are already current, and the host
+    // re-reads them once this returns.
+    if (inChangeAction == kChangeActionTiming) return kAudioHardwareNoError;
+
     // inChangeAction carries the requested sample rate, set by SetPropertyData.
     Float64 newRate = (Float64)inChangeAction;
     if (!IsSupportedSampleRate(newRate)) return kAudioHardwareIllegalOperationError;
 
+    // The host is not obliged to stop IO before a configuration change, and a
+    // DAW that keeps the device open would otherwise never get its new rate.
+    // Restart the USB session underneath the running clients instead; the new
+    // clock seed tells CoreAudio the timeline started over.
     pthread_mutex_lock(&gIOMutex);
-    if (gIORunningCount > 0) {
-        pthread_mutex_unlock(&gIOMutex);
-        return kAudioHardwareIllegalOperationError;
-    }
+    Boolean wasRunning = gIORunningCount > 0;
+    if (wasRunning) A8DJ_UsbStop();
     pthread_mutex_lock(&gStateMutex);
     gSampleRate = newRate;
     mach_timebase_info_data_t tb;
@@ -386,9 +418,9 @@ static OSStatus Audio8DJ_PerformDeviceConfigurationChange(AudioServerPlugInDrive
     gTimestampSeed = 0;
     gAnchorHostTime = mach_absolute_time();
     pthread_mutex_unlock(&gStateMutex);
-    pthread_mutex_unlock(&gIOMutex);
     OSStatus err = kAudioHardwareNoError;
-
+    if (wasRunning && A8DJ_UsbStart(newRate) != 0) err = kAudioHardwareNotRunningError;
+    pthread_mutex_unlock(&gIOMutex);
     return err;
 }
 
@@ -586,10 +618,12 @@ static OSStatus GetDeviceProperty(const AudioObjectPropertyAddress *inAddress, U
         RETURN_VALUE(0, UInt32);
 
     case kAudioDevicePropertyLatency:
-        // Playback is read NBUF transfers ahead of the device's play position;
-        // CoreAudio has to write that far ahead or it writes behind our reads.
-        RETURN_VALUE(inAddress->mScope == kAudioObjectPropertyScopeOutput
-                     ? A8DJ_UsbOutputLeadFrames(gSampleRate) : 0, UInt32);
+        // CoreAudio adds Latency and SafetyOffset for the latency apps see.
+        // The queue lead lives in the safety offset (it is what makes the HAL
+        // write early), so this holds only what lies outside the published
+        // timeline. It used to repeat the lead and overstate output latency.
+        RETURN_VALUE(A8DJ_UsbDeviceLatencyFrames(gSampleRate,
+                         inAddress->mScope == kAudioObjectPropertyScopeInput), UInt32);
     case kAudioDevicePropertySafetyOffset:
         // Measured: kAudioDevicePropertyLatency does not move CoreAudio's write
         // position at all (it is reported to apps, not used for scheduling).
@@ -608,11 +642,9 @@ static OSStatus GetDeviceProperty(const AudioObjectPropertyAddress *inAddress, U
         // that boundary with nothing left for jitter, and it measured negative
         // at every buffer size -- -10 frames and 613 reads past the end in 25 s
         // at 32 frames, which is the crackle heard while recording. The second
-        // transfer is the jitter allowance.
-        RETURN_VALUE(inAddress->mScope == kAudioObjectPropertyScopeOutput
-                     ? A8DJ_UsbOutputLeadFrames(gSampleRate)
-                       + A8DJ_UsbTransferFrames(gSampleRate)
-                     : 2 * A8DJ_UsbTransferFrames(gSampleRate), UInt32);
+        // transfer is the jitter allowance (in_margin_us in the config).
+        RETURN_VALUE(A8DJ_UsbSafetyOffsetFrames(gSampleRate,
+                         inAddress->mScope != kAudioObjectPropertyScopeOutput), UInt32);
     case kAudioDevicePropertyZeroTimeStampPeriod:
         RETURN_VALUE(kZeroTimeStampPeriod, UInt32);
 

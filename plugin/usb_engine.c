@@ -11,9 +11,15 @@
 #include "midi.h"
 #include "audio_ring.h"
 #include "status_file.h"
+#include "sample_convert.h"
 #ifndef A8DJ_STATUS_OPEN
 #define A8DJ_STATUS_OPEN A8DJ_OpenStatusFile
 #endif
+#ifndef A8DJ_LOG_OPEN
+#define A8DJ_LOG_OPEN A8DJ_OpenLogFile
+#endif
+#define A8DJ_EVENT_LOG "/tmp/a8dj-events.log"
+#include <time.h>
 #include <math.h>
 #include <limits.h>
 
@@ -30,6 +36,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 #include "../firmware/audio8dj_firmware.h"
 
@@ -90,6 +97,8 @@ typedef struct {
     int idx;
     int isInput;
     int pending; // owned by the USB run-loop thread
+    UInt64   busFrame;    // first bus frame (1 ms) the transfer was queued for
+    unsigned gapUframes;  // IN: microframes skipped just before this transfer
 } XferRef;
 
 static struct {
@@ -163,6 +172,7 @@ static struct {
     _Atomic unsigned driftFix;                   // microframes lengthened or shortened
     _Atomic uint64_t lastWriteFrame;             // where CoreAudio last wrote
     _Atomic uint64_t lastWriteEnd;               // one past the last frame it wrote
+    _Atomic uint32_t lastWriteFrames;            // size of its last write (its buffer)
 
     // Pop-noise accounting. A click has exactly three possible origins and
     // these separate them:
@@ -174,15 +184,87 @@ static struct {
     _Atomic unsigned frErrIn, frErrOut;          // microframes with a non-zero frStatus
     _Atomic unsigned shortIn;                    // microframes the device left empty
     _Atomic unsigned outStarve;                  // output read ahead of CoreAudio
+    _Atomic unsigned outIdleEvents;              // times CoreAudio stopped writing output
+    int      outIdle;                            // streaming thread only
+    uint64_t outIdleStart;                       // frame where writes stopped
+    unsigned starveRun;                          // short microframes not yet classified
+    long     starveRunMin;
     _Atomic unsigned startStarve;                // same, but in the first second
     _Atomic long outMarginMin;               // closest approach, in frames
     _Atomic unsigned inStarve;                   // capture read ahead of the device
     _Atomic long inMarginMin;                // closest approach, in frames
     _Atomic unsigned inGap;                      // capture frames never filled
+    _Atomic unsigned inLostFrames;               // capture frames counted as silence
     unsigned publishTick;
+
+    // Microframes the bus skipped because a transfer had to be rescheduled.
+    // The device kept converting through them, so the timelines must too.
+    unsigned pendingInGapUframes, pendingOutGapUframes;
+    double   inLossCarry;                        // fractional frames of lost IN time
+
+    // Clock filter: a delay-locked loop over (frames received, bus time).
+    // Run on the streaming thread only; the result goes out via PublishClock.
+    int      dllPrimed;
+    uint64_t dllPos;
+    double   dllTime, dllTicksPerFrame, dllNominal;
+    double   dllB, dllC;
+    _Atomic long     clockErrMaxUs;              // worst raw-vs-filtered disagreement
+    _Atomic unsigned clockResets;                // filter restarts after a jump
+
+    // Diagnostics, to tell apart what a single cumulative counter cannot:
+    // which direction fell behind, how late the callbacks were running, and
+    // whether clock error is constant or only appears around those events.
+    _Atomic unsigned resyncsIn, resyncsOut;
+    _Atomic long     clockErrWinUs;              // max since the monitor last looked
+    _Atomic int      cbLateWinMs, cbLateMaxMs;   // IN completion delay past its last bus frame
+    _Atomic long     inMarginWin, outMarginWin;  // closest approach since last look
+    uint64_t         sessionHost;                // mach time streaming started
+    uint64_t         lastSpikeHost;              // rate-limits clock-spike events
+    // Events from the streaming thread (single producer) to the monitor
+    // thread (single consumer). Overwrites when full; the consumer notices.
+    struct {
+        uint64_t host;
+        int      kind, a, b;
+    } events[64];
+    _Atomic unsigned evHead;
+    unsigned evTail;
 
     char status[64];
 } g;
+
+enum { EV_RESYNC_IN = 1, EV_RESYNC_OUT, EV_REARM, EV_CLOCK_RESET, EV_CLOCK_SPIKE,
+       EV_OUT_IDLE, EV_OUT_RESUME };
+#define EVENT_RING 64u
+
+// Streaming thread only. No locks, no IO.
+static void PushEvent(int kind, int a, int b, uint64_t host)
+{
+    unsigned head = atomic_load_explicit(&g.evHead, memory_order_relaxed);
+    unsigned i = head % EVENT_RING;
+    g.events[i].host = host ? host : mach_absolute_time();
+    g.events[i].kind = kind;
+    g.events[i].a = a;
+    g.events[i].b = b;
+    atomic_store_explicit(&g.evHead, head + 1, memory_order_release);
+}
+
+static inline void AtomicMaxLong(_Atomic long *v, long x)
+{
+    long cur = atomic_load_explicit(v, memory_order_relaxed);
+    while (x > cur && !atomic_compare_exchange_weak(v, &cur, x)) {}
+}
+
+static inline void AtomicMinLong(_Atomic long *v, long x)
+{
+    long cur = atomic_load_explicit(v, memory_order_relaxed);
+    while (x < cur && !atomic_compare_exchange_weak(v, &cur, x)) {}
+}
+
+static inline void AtomicMaxInt(_Atomic int *v, int x)
+{
+    int cur = atomic_load_explicit(v, memory_order_relaxed);
+    while (x > cur && !atomic_compare_exchange_weak(v, &cur, x)) {}
+}
 
 static void PublishClock(uint64_t frames, uint64_t hostTime, int newSession)
 {
@@ -229,15 +311,67 @@ uint32_t A8DJ_UsbOutputLeadFrames(double inRate)
     return NBUF * A8DJ_UsbTransferFrames(inRate);
 }
 
+// Tuning read from the config file, in microseconds so one value holds at
+// every rate. See LoadConfig.
+static int gInMarginUs     = -1;   // -1: one transfer
+static int gOutMarginUs    = 0;
+static int gHwLatencyInUs  = 0;
+static int gHwLatencyOutUs = 0;
+
+static uint32_t UsToFrames(int us, double inRate)
+{
+    if (us <= 0 || !(inRate > 0)) return 0;
+    return (uint32_t)llround((double)us * inRate / 1.0e6);
+}
+
+// How far from "now" CoreAudio must stay.
+//
+// Output: the engine reads the ring when it queues a transfer, NBUF transfers
+// ahead of the bus, and that transfer spans one more. Anything less and
+// CoreAudio writes frames the engine has already sent.
+//
+// Input: frames arrive a whole transfer at a time, so the newest transfer's
+// worth is never readable yet; the margin on top covers completion latency
+// and the device's uneven packet sizes.
+uint32_t A8DJ_UsbSafetyOffsetFrames(double inRate, int isInput)
+{
+    uint32_t xfer = A8DJ_UsbTransferFrames(inRate);
+    if (isInput)
+        return xfer + (gInMarginUs < 0 ? xfer : UsToFrames(gInMarginUs, inRate));
+    return A8DJ_UsbOutputLeadFrames(inRate) + xfer + UsToFrames(gOutMarginUs, inRate);
+}
+
+// What lies outside the published timeline: converters and the device's own
+// buffering. The queue lead is already in the safety offset; reporting it
+// here as well counted it twice in every app's latency compensation.
+uint32_t A8DJ_UsbDeviceLatencyFrames(double inRate, int isInput)
+{
+    return UsToFrames(isInput ? gHwLatencyInUs : gHwLatencyOutUs, inRate);
+}
+
 static int64_t FrameDistance(uint64_t a, uint64_t b)
 {
     if (a >= b) return a - b > INT64_MAX ? INT64_MAX : (int64_t)(a - b);
     return b - a > INT64_MAX ? -INT64_MAX : -(int64_t)(b - a);
 }
 
+// Per-second view, kept by the monitor thread and shown in the status file.
+static _Atomic long gSecClockErrUs;
+static _Atomic long gSecInMargin = 1L << 30, gSecOutMargin = 1L << 30;
+static _Atomic int  gSecCbLateMs;
+
+static void FormatMargin(char *buf, size_t cap, long v)
+{
+    if (v >= (1L << 30)) snprintf(buf, cap, "-");
+    else snprintf(buf, cap, "%ld", v);
+}
+
 // The device name is cached by CoreAudio, so it cannot report live state.
 static void PublishStatus(void)
 {
+    char secIn[24], secOut[24];
+    FormatMargin(secIn, sizeof(secIn), gSecInMargin);
+    FormatMargin(secOut, sizeof(secOut), gSecOutMargin);
     pthread_mutex_lock(&gStatusFileMutex);
     FILE *f = A8DJ_STATUS_OPEN("/tmp/a8dj-status.txt");
     if (!f) { pthread_mutex_unlock(&gStatusFileMutex); return; }
@@ -254,7 +388,12 @@ static void PublishStatus(void)
             "resync=%u submitFail=%u rearm=%u\n"
             "USB: 転送失敗 in=%u out=%u  µframe異常 in=%u out=%u  空 in=%u  端数 in=%u\n"
             "出力枯渇=%u 回(起動時 %u)  最小余裕=%ld フレーム  クロック補正=%u 回\n"
-            "録音先読み=%u 回  最小余裕=%ld フレーム\n"
+            "出力未使用=%u 回%s (CoreAudio が出力を書いていない間は枯渇に数えない)\n"
+            "録音先読み=%u 回  最小余裕=%ld フレーム  欠落を無音で補完=%u フレーム\n"
+            "クロック: 最大ずれ=%ld µs  フィルタ再始動=%u 回\n"
+            "resync 内訳: IN=%u OUT=%u  完了遅延最大=%d ms\n"
+            "直近1秒: クロック最大ずれ=%ld µs  完了遅延最大=%d ms  録音余裕最小=%s  出力余裕最小=%s\n"
+            "イベントログ: " A8DJ_EVENT_LOG "\n"
             "MIDI in=%u バイト out=%u バイト  EP1受信=%u パケット(ACK %u) 読み出し%s 取りこぼし%u\n"
             "MIDI ポート: %s\n",
             A8DJ_UsbStatus(), g.rate,
@@ -267,7 +406,11 @@ static void PublishStatus(void)
             g.resyncs, g.submitFails, g.rearms,
             g.xferErrIn, g.xferErrOut, g.frErrIn, g.frErrOut, g.shortIn, g.inGap,
             g.outStarve, g.startStarve, g.outMarginMin, g.driftFix,
-            g.inStarve, g.inMarginMin,
+            g.outIdleEvents, g.outIdle ? " (現在 未使用)" : "",
+            g.inStarve, g.inMarginMin, g.inLostFrames,
+            g.clockErrMaxUs, g.clockResets,
+            g.resyncsIn, g.resyncsOut, g.cbLateMaxMs,
+            (long)gSecClockErrUs, (int)gSecCbLateMs, secIn, secOut,
             g.midiIn, g.midiOut,
             g.midiPkts, g.midiAcks, g.midiPosted ? "あり" : "なし", g.midiLost,
             A8DJ_MidiStatus());
@@ -528,7 +671,7 @@ static float DecodeFrames(const uint8_t *src, int nFrames, uint64_t startFrame)
             for (int s = 0; s < WIRE_STREAMS; s++) {
                 int32_t v = (b[4 + s] << 16) | (b[8 + s] << 8) | b[12 + s];
                 if (v & 0x800000) v -= 0x1000000;
-                float sample = (Float32)v * (1.0f / 8388608.0f);
+                float sample = A8DJ_S24ToFloat(v);
                 dst[WireChannel(s, blk)] = sample;
                 if (fabsf(sample) > peak) peak = fabsf(sample);
             }
@@ -550,7 +693,17 @@ static float DecodeFrames(const uint8_t *src, int nFrames, uint64_t startFrame)
 static void EncodeStream(uint8_t *dst, int nBytes, uint64_t bytePos,
                          const Float32 (*src)[A8DJ_CHANNELS])
 {
+    if (nBytes <= 0) return;
     uint64_t blk0 = (bytePos / 16) / 2;
+    uint64_t blkN = ((bytePos + (uint64_t)nBytes - 1) / 16) / 2;
+
+    // Convert each sample once; the byte loop below needs it three times.
+    int32_t v[OUT_MAX_UFRAME_FRAMES + 1][A8DJ_CHANNELS];
+    int nFrames = (int)(blkN - blk0) + 1;
+    if (nFrames > OUT_MAX_UFRAME_FRAMES + 1) nFrames = OUT_MAX_UFRAME_FRAMES + 1;
+    for (int j = 0; j < nFrames; j++)
+        for (int c = 0; c < A8DJ_CHANNELS; c++)
+            v[j][c] = A8DJ_FloatToS24(src[j][c]);
 
     for (int i = 0; i < nBytes; i++) {
         uint64_t gp  = bytePos + (uint64_t)i;
@@ -563,13 +716,10 @@ static void EncodeStream(uint8_t *dst, int nBytes, uint64_t bytePos,
         int plane = (off - 4) / 4;
         int strm  = (off - 4) % 4;
         int ch    = strm * 2 + par;
+        int j     = (int)(blk / 2 - blk0);
+        if (j >= nFrames) { dst[i] = 0; continue; }
 
-        Float32 x = src[blk / 2 - blk0][ch];
-        if (!isfinite(x)) x = 0.0f;
-        if (x >  1.0f) x =  1.0f;
-        if (x < -1.0f) x = -1.0f;
-        int32_t v = (int32_t)(x * 8388607.0f);
-        dst[i] = (uint8_t)(v >> (16 - 8 * plane));
+        dst[i] = (uint8_t)(v[j][ch] >> (16 - 8 * plane));
     }
 }
 
@@ -705,9 +855,130 @@ static UInt64 BusFrameNow(void)
 {
     UInt64 f = 0;
     AbsoluteTime at;
-    if (!g.intf) return 0;
+    if (!g.intf || !(*g.intf)->GetBusFrameNumber) return 0;
     if ((*g.intf)->GetBusFrameNumber(g.intf, &f, &at) != KERN_SUCCESS) return 0;
     return f;
+}
+
+static double TicksPerSecond(void)
+{
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    return 1.0e9 * (double)tb.denom / (double)tb.numer;
+}
+
+// Host time at which bus frame `frame` began. The bus frame counter runs off
+// the host controller's clock, so this does not move when our callback is
+// late -- unlike mach_absolute_time() taken inside the callback, which carried
+// every bit of scheduling jitter straight into the published clock.
+static double BusFrameHostTime(UInt64 frame)
+{
+    UInt64 f = 0;
+    AbsoluteTime at;
+    if (g.intf && (*g.intf)->GetBusFrameNumber &&
+        (*g.intf)->GetBusFrameNumber(g.intf, &f, &at) == KERN_SUCCESS &&
+        f >= frame && f - frame < 1000) {
+        // How long after its last bus frame this completion ran. It is the
+        // slack the queue has to absorb; a resync means it ran out.
+        int late = (int)(f - frame);
+        AtomicMaxInt(&g.cbLateWinMs, late);
+        AtomicMaxInt(&g.cbLateMaxMs, late);
+        uint64_t t = ((uint64_t)at.hi << 32) | at.lo;
+        return (double)t - (double)(f - frame) * (TicksPerSecond() / 1000.0);
+    }
+    return (double)mach_absolute_time();
+}
+
+// Delay-locked loop (Adriaensen, "Using a DLL to filter time") over the pairs
+// (frames received, time they were complete). Arrival times jitter by up to a
+// microframe from the device's uneven packet sizes, and by more when the
+// bus-frame read itself is late; the loop keeps the line through them, which
+// is what CoreAudio extrapolates from between zero timestamps.
+static uint64_t ClockObserve(uint64_t pos, double t)
+{
+    if (!g.dllPrimed) {
+        g.dllNominal = g.rate > 0 ? TicksPerSecond() / (double)g.rate : 0;
+        g.dllTicksPerFrame = g.dllNominal;
+        g.dllPos = pos;
+        g.dllTime = t;
+        g.dllPrimed = 1;
+        return (uint64_t)llround(t);
+    }
+    if (pos <= g.dllPos || g.dllNominal <= 0) return (uint64_t)llround(g.dllTime);
+
+    double frames = (double)(pos - g.dllPos);
+    double pred = g.dllTime + frames * g.dllTicksPerFrame;
+    double e = t - pred;
+    double ticksPerUs = g.dllNominal * (double)g.rate / 1.0e6;
+    double errUs = fabs(e) / ticksPerUs;
+
+    // A jump this large is not jitter: the stream stalled or was rescheduled.
+    // Start over from the new observation rather than slew for seconds.
+    if (errUs > 20000.0) {
+        g.clockResets++;
+        PushEvent(EV_CLOCK_RESET, (int)(e / ticksPerUs / 1000.0), 0, 0);
+        g.dllPos = pos;
+        g.dllTime = t;
+        return (uint64_t)llround(t);
+    }
+    if (pos > (uint64_t)g.rate) {
+        if (errUs > (double)g.clockErrMaxUs) g.clockErrMaxUs = (long)errUs;
+        AtomicMaxLong(&g.clockErrWinUs, (long)errUs);
+        // Signed: positive means the frames completed later than the line.
+        uint64_t now = mach_absolute_time();
+        // The bus frame read is quantized to 1 ms (measured: the microframe
+        // call returns frame * 8 on this controller), so up to ~1 ms of
+        // scatter is normal. Only report what goes beyond it.
+        if (errUs > 1500.0 && now - g.lastSpikeHost > (uint64_t)(TicksPerSecond() / 10)) {
+            g.lastSpikeHost = now;
+            PushEvent(EV_CLOCK_SPIKE, (int)(e / ticksPerUs), (int)(pos % 1000000000), now);
+        }
+    }
+
+    // One late reading must not drag the line: clip what the loop sees.
+    double clip = 1000.0 * ticksPerUs;
+    if (e >  clip) e =  clip;
+    if (e < -clip) e = -clip;
+
+    // Wide for the first second to lock quickly, then narrow.
+    double bandwidth = pos < (uint64_t)g.rate ? 4.0 : 1.0;
+    double w = 2.0 * M_PI * bandwidth * frames / (double)g.rate;
+    g.dllTime = pred + M_SQRT2 * w * e;
+    g.dllTicksPerFrame += w * w * e / frames;
+    double lo = g.dllNominal * 0.999, hi = g.dllNominal * 1.001;
+    if (g.dllTicksPerFrame < lo) g.dllTicksPerFrame = lo;
+    if (g.dllTicksPerFrame > hi) g.dllTicksPerFrame = hi;
+    g.dllPos = pos;
+    return (uint64_t)llround(g.dllTime);
+}
+
+// The device kept converting through microframes we never read, so the
+// timeline advances by the time they covered and the ring keeps silence there.
+// Otherwise the clock falls permanently behind real time, and the drift loop
+// "corrects" that by starving the device's output FIFO.
+static uint64_t LostInFrames(unsigned uframes)
+{
+    g.inLossCarry += (double)uframes * (double)g.rate / 8000.0;
+    uint64_t n = (uint64_t)g.inLossCarry;
+    g.inLossCarry -= (double)n;
+    g.inLostFrames += (unsigned)n;
+    return n;
+}
+
+// Microframes between where a direction was scheduled to continue and where
+// it actually restarts. Capped so a garbage frame number cannot run away.
+static unsigned GapUframes(UInt64 planned, UInt64 restart)
+{
+    if (restart <= planned) return 0;
+    UInt64 ms = restart - planned;
+    return ms > 10000 ? 80000u : (unsigned)(ms * 8);
+}
+
+// The OUT side of the same thing: skip the frames that would have played in
+// the gap, so what follows stays aligned with the device and the IN clock.
+static void SkipOutUframes(unsigned uframes)
+{
+    while (uframes--) g.outFrames += (uint64_t)SamplesInUframe(g.uframeCursor++);
 }
 
 // Schedules one transfer, resynchronising to the current bus frame if the one
@@ -730,13 +1001,25 @@ static int SubmitIn(int idx)
     if (r != kIOReturnSuccess) {
         UInt64 now = BusFrameNow();
         if (!now) { g.submitFails++; return 0; }
-        g.nextIn = now + RESYNC_FRAMES;
+        UInt64 restart = now + RESYNC_FRAMES;
+        unsigned gap = GapUframes(g.nextIn, restart);
+        g.pendingInGapUframes += gap;
+        // a: how far the bus had already passed the planned frame (ms);
+        // b: the gap the device sees, in microframes.
+        PushEvent(EV_RESYNC_IN, (int)((int64_t)now - (int64_t)g.nextIn), (int)gap, 0);
+        g.nextIn = restart;
         g.resyncs++;
+        g.resyncsIn++;
         r = (*g.intf)->ReadIsochPipeAsync(g.intf, g.pipeIsoIn, g.inBuf[idx], g.nextIn,
                                           XFER_UFRAMES, g.inList[idx],
                                           XferComplete, &g.inRef[idx]);
         if (r != kIOReturnSuccess) { g.submitFails++; return 0; }
     }
+    // Completions arrive in bus order, so the gap is accounted just before
+    // the first frames that came after it.
+    g.inRef[idx].busFrame = g.nextIn;
+    g.inRef[idx].gapUframes = g.pendingInGapUframes;
+    g.pendingInGapUframes = 0;
     g.nextIn += XFER_FRAMES;
     g.inRef[idx].pending = 1;
     g.inflight++;
@@ -786,10 +1069,54 @@ static int DriftAdjust(void)
     return adjust;
 }
 
+// Output starvation and "nobody is writing output" look the same from here:
+// the ring is behind. IO keeps running for input-only clients, and then every
+// microframe used to count as a starve (33,000 in an hour, margins of minus
+// four seconds). So a run of short microframes is held back: if CoreAudio
+// writes again it was a real starve and is counted; if it falls further behind
+// than a writer ever would, the output is idle and the run is discarded.
+static void CountOutputMargin(long margin, int ready)
+{
+    if (ready) {
+        if (g.outIdle) {
+            g.outIdle = 0;
+            uint64_t idleFrames = g.outFrames - g.outIdleStart;
+            PushEvent(EV_OUT_RESUME, (int)(idleFrames * 1000 / (uint64_t)g.rate), 0, 0);
+        }
+        if (g.starveRun) {
+            g.outStarve += g.starveRun;
+            if (g.starveRunMin < g.outMarginMin) g.outMarginMin = g.starveRunMin;
+            AtomicMinLong(&g.outMarginWin, g.starveRunMin);
+            g.starveRun = 0;
+        }
+        if (margin < g.outMarginMin) g.outMarginMin = margin;
+        AtomicMinLong(&g.outMarginWin, margin);
+        return;
+    }
+    if (g.outIdle) return;
+    // A live writer stays ahead of us by its safety offset plus a buffer.
+    // Two of its buffers plus 10 ms behind means it has stopped writing.
+    long idleAfter = 2L * (long)g.lastWriteFrames + g.rate / 100;
+    if (-margin > idleAfter) {
+        g.outIdle = 1;
+        g.outIdleEvents++;
+        g.outIdleStart = g.lastWriteEnd;
+        PushEvent(EV_OUT_IDLE, (int)g.starveRun, 0, 0);
+        g.starveRun = 0;
+        return;
+    }
+    if (!g.starveRun || margin < g.starveRunMin) g.starveRunMin = margin;
+    g.starveRun++;
+}
+
 static int SubmitOut(int idx)
 {
     if (!g.running || g.outRef[idx].pending) return 0;
     uint8_t *buf = g.outBuf[idx];
+    if (g.pendingOutGapUframes) {
+        SkipOutUframes(g.pendingOutGapUframes);
+        g.pendingOutGapUframes = 0;
+    }
     int adjust = DriftAdjust();
     // WriteIsochPipeAsync reads one *contiguous* buffer: frame f starts at the
     // sum of the preceding frReqCounts, not at a fixed stride. Laying the
@@ -824,12 +1151,8 @@ static int SubmitOut(int idx)
             // The first second is always short: we start sending before
             // CoreAudio's first IOProc has run. Counting it would bury the
             // number that matters, which is the worst case once running.
-            if (g.deviceFrames > (uint64_t)g.rate) {
-                if (margin < g.outMarginMin) g.outMarginMin = margin;
-                if (!ready) g.outStarve++;
-            } else if (!ready) {
-                g.startStarve++;
-            }
+            if (g.deviceFrames > (uint64_t)g.rate) CountOutputMargin(margin, ready);
+            else if (!ready) g.startStarve++;
         }
 
         // The packet starts 8 bytes into a block, so it straddles one more
@@ -866,13 +1189,21 @@ static int SubmitOut(int idx)
     if (r != kIOReturnSuccess) {
         UInt64 now = BusFrameNow();
         if (!now) { g.submitFails++; return 0; }
-        g.nextOut = now + RESYNC_FRAMES;
+        UInt64 restart = now + RESYNC_FRAMES;
+        // This buffer is already built; the frames it pushed later are made
+        // up by skipping ahead in the ones after it.
+        unsigned gap = GapUframes(g.nextOut, restart);
+        g.pendingOutGapUframes += gap;
+        PushEvent(EV_RESYNC_OUT, (int)((int64_t)now - (int64_t)g.nextOut), (int)gap, 0);
+        g.nextOut = restart;
         g.resyncs++;
+        g.resyncsOut++;
         r = (*g.intf)->WriteIsochPipeAsync(g.intf, g.pipeIsoOut, buf, g.nextOut,
                                            XFER_UFRAMES, g.outList[idx],
                                            XferComplete, &g.outRef[idx]);
         if (r != kIOReturnSuccess) { g.submitFails++; return 0; }
     }
+    g.outRef[idx].busFrame = g.nextOut;
     g.nextOut += XFER_FRAMES;
     g.outRef[idx].pending = 1;
     g.inflight++;
@@ -886,7 +1217,12 @@ static void RearmAll(void)
     if (!g.running) return;
     UInt64 now = BusFrameNow();
     if (!now) return;
-    g.nextIn = g.nextOut = now + RESYNC_FRAMES;
+    UInt64 restart = now + RESYNC_FRAMES;
+    g.pendingInGapUframes  += GapUframes(g.nextIn, restart);
+    g.pendingOutGapUframes += GapUframes(g.nextOut, restart);
+    PushEvent(EV_REARM, (int)((int64_t)now - (int64_t)g.nextIn),
+              (int)((int64_t)now - (int64_t)g.nextOut), 0);
+    g.nextIn = g.nextOut = restart;
     g.rearms++;
     for (int i = 0; i < NBUF; i++) SubmitIn(i);
     for (int i = 0; i < NBUF; i++) SubmitOut(i);
@@ -913,12 +1249,19 @@ static void XferComplete(void *refcon, IOReturn result, void *arg0)
             if (g.outList[ref->idx][f].frStatus != kIOReturnSuccess) g.frErrOut++;
     }
 
-    if (g.running && ref->isInput && result == kIOReturnSuccess) {
+    if (g.running && ref->isInput && result != kIOReturnAborted) {
         // The device's own delivery is the clock: every frame that arrives
-        // advances the timeline the plug-in publishes to CoreAudio.
+        // advances the timeline the plug-in publishes to CoreAudio. Time the
+        // bus spent on packets we lost advances it too (LostInFrames).
         uint64_t pos = g.deviceFrames;
+        if (ref->gapUframes) pos += LostInFrames(ref->gapUframes);
+        ref->gapUframes = 0;
         float ipk = 0;
-        for (int f = 0; f < XFER_UFRAMES; f++) {
+        // A failed transfer leaves no trustworthy per-packet status; the
+        // device converted a whole transfer's worth regardless.
+        int whole = result != kIOReturnSuccess && result != kIOReturnUnderrun;
+        if (whole) pos += LostInFrames((unsigned)XFER_UFRAMES);
+        for (int f = 0; !whole && f < XFER_UFRAMES; f++) {
             UInt16 got = g.inList[ref->idx][f].frActCount;
             int    n   = got / WIRE_FRAME_BYTES;
             // We always ask for a full ISO_MAXPKT, so a packet carrying less
@@ -926,8 +1269,11 @@ static void XferComplete(void *refcon, IOReturn result, void *arg0)
             // not an error -- the device paces itself and sends nothing at all
             // in roughly one microframe in seven.
             IOReturn fs = g.inList[ref->idx][f].frStatus;
-            if (fs != kIOReturnSuccess && fs != kIOReturnUnderrun) { g.frErrIn++; continue; }
-            if (got > ISO_MAXPKT) { g.frErrIn++; continue; }
+            if ((fs != kIOReturnSuccess && fs != kIOReturnUnderrun) || got > ISO_MAXPKT) {
+                g.frErrIn++;
+                pos += LostInFrames(1);
+                continue;
+            }
             if (n <= 0) { g.shortIn++; continue; }
             // A packet that is not a whole number of wire frames means the
             // device truncated mid-frame; the leftover bytes are lost and the
@@ -938,7 +1284,10 @@ static void XferComplete(void *refcon, IOReturn result, void *arg0)
             pos += (uint64_t)n;
         }
         g.lastInPeak = ipk;
-        PublishClock(pos, mach_absolute_time(), 0);
+        // pos counts everything the device delivered by the end of this
+        // transfer's last bus frame.
+        uint64_t host = ClockObserve(pos, BusFrameHostTime(ref->busFrame + (UInt64)XFER_FRAMES));
+        PublishClock(pos, host, 0);
     }
 
     if (g.running) {
@@ -1089,6 +1438,104 @@ static void WatchdogFired(CFRunLoopTimerRef timer, void *info)
 
 // The streaming thread runs under a time-constraint policy, so it must not do
 // file IO. This one publishes the counters instead, once a second.
+typedef struct {
+    unsigned resyncIn, resyncOut, rearms, inStarve, outStarve, lost;
+    unsigned frErrIn, frErrOut, xferErrIn, xferErrOut, clockResets, outIdle;
+} CounterSnapshot;
+
+static CounterSnapshot TakeSnapshot(void)
+{
+    return (CounterSnapshot){
+        g.resyncsIn, g.resyncsOut, g.rearms, g.inStarve, g.outStarve, g.inLostFrames,
+        g.frErrIn, g.frErrOut, g.xferErrIn, g.xferErrOut, g.clockResets, g.outIdleEvents };
+}
+
+static double SessionSeconds(uint64_t host)
+{
+    if (!g.sessionHost || host < g.sessionHost) return 0;
+    return (double)(host - g.sessionHost) / TicksPerSecond();
+}
+
+// One second of diagnostics: drain the event ring into the log, then write a
+// summary line if anything happened. Lines carry wall-clock time for lining
+// up with what was heard, and stream time (t=) for lining up with each other.
+static void MonitorTick(FILE *log, CounterSnapshot *prev)
+{
+    long errWin  = atomic_exchange(&g.clockErrWinUs, 0);
+    int  lateWin = atomic_exchange(&g.cbLateWinMs, 0);
+    long inWin   = atomic_exchange(&g.inMarginWin, 1L << 30);
+    long outWin  = atomic_exchange(&g.outMarginWin, 1L << 30);
+    gSecClockErrUs = errWin;
+    gSecCbLateMs   = lateWin;
+    gSecInMargin   = inWin;
+    gSecOutMargin  = outWin;
+    if (!log) { *prev = TakeSnapshot(); g.evTail = g.evHead; return; }
+
+    char wall[16];
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(wall, sizeof(wall), "%H:%M:%S", &tmv);
+
+    unsigned head = atomic_load_explicit(&g.evHead, memory_order_acquire);
+    if (head - g.evTail > EVENT_RING) {
+        fprintf(log, "[%s] イベント %u 件を取りこぼし\n", wall, head - g.evTail - EVENT_RING);
+        g.evTail = head - EVENT_RING;
+    }
+    for (; g.evTail != head; g.evTail++) {
+        unsigned i = g.evTail % EVENT_RING;
+        double t = SessionSeconds(g.events[i].host);
+        int a = g.events[i].a, b = g.events[i].b;
+        switch (g.events[i].kind) {
+        case EV_RESYNC_IN:
+        case EV_RESYNC_OUT:
+            fprintf(log, "[%s t=%.3fs] resync %s: 予定フレームを %d ms 過ぎていた  欠落 %.3f ms\n",
+                    wall, t, g.events[i].kind == EV_RESYNC_IN ? "IN " : "OUT", a, b / 8.0);
+            break;
+        case EV_REARM:
+            fprintf(log, "[%s t=%.3fs] rearm: 全転送が停止  IN %d ms / OUT %d ms 遅れ\n", wall, t, a, b);
+            break;
+        case EV_CLOCK_RESET:
+            fprintf(log, "[%s t=%.3fs] クロックフィルタ再始動: ずれ %+d ms\n", wall, t, a);
+            break;
+        case EV_OUT_IDLE:
+            fprintf(log, "[%s t=%.3fs] 出力未使用: CoreAudio の書き込みが止まった (直前の不足 %d µframe は枯渇に数えない)\n",
+                    wall, t, a);
+            break;
+        case EV_OUT_RESUME:
+            fprintf(log, "[%s t=%.3fs] 出力再開: 停止 %d ms%s\n", wall, t, a,
+                    a < 1000 ? "  ※短い停止は書き込み側の遅れ(実際の音切れ)の可能性" : "");
+            break;
+        case EV_CLOCK_SPIKE:
+            fprintf(log, "[%s t=%.3fs] クロックずれ %+d µs (到着が線より%s)\n",
+                    wall, t, a, a > 0 ? "遅い" : "早い");
+            break;
+        default:
+            break;
+        }
+    }
+
+    CounterSnapshot cur = TakeSnapshot();
+    int changed = memcmp(&cur, prev, sizeof(cur)) != 0;
+    if (changed || errWin > 500) {
+        char inM[24], outM[24];
+        FormatMargin(inM, sizeof(inM), inWin);
+        FormatMargin(outM, sizeof(outM), outWin);
+        fprintf(log, "[%s t=%.0fs] 1秒集計: resync IN+%u OUT+%u rearm+%u | 録音先読み+%u (最小余裕 %s) | "
+                     "出力枯渇+%u (最小余裕 %s) | 出力未使用+%u | 欠落補完+%u | µframe異常 in+%u out+%u | "
+                     "転送失敗 in+%u out+%u | フィルタ再始動+%u | クロック最大ずれ %ld µs | 完了遅延最大 %d ms\n",
+                wall, SessionSeconds(mach_absolute_time()),
+                cur.resyncIn - prev->resyncIn, cur.resyncOut - prev->resyncOut, cur.rearms - prev->rearms,
+                cur.inStarve - prev->inStarve, inM, cur.outStarve - prev->outStarve, outM,
+                cur.outIdle - prev->outIdle,
+                cur.lost - prev->lost, cur.frErrIn - prev->frErrIn, cur.frErrOut - prev->frErrOut,
+                cur.xferErrIn - prev->xferErrIn, cur.xferErrOut - prev->xferErrOut,
+                cur.clockResets - prev->clockResets, errWin, lateWin);
+    }
+    *prev = cur;
+    fflush(log);
+}
+
 static void *MonitorThread(void *arg)
 {
     (void)arg;
@@ -1099,12 +1546,33 @@ static void *MonitorThread(void *arg)
     thread_policy_set(pthread_mach_thread_np(pthread_self()),
                       THREAD_STANDARD_POLICY, (thread_policy_t)&std,
                       THREAD_STANDARD_POLICY_COUNT);
+    FILE *log = A8DJ_LOG_OPEN(A8DJ_EVENT_LOG, 1 << 20);
+    if (log) {
+        char wall[32];
+        time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        strftime(wall, sizeof(wall), "%Y-%m-%d %H:%M:%S", &tmv);
+        fprintf(log, "=== %s 開始 %d Hz  uframes=%d nbuf=%d  lead=%u フレーム  "
+                     "セーフティ in=%u out=%u ===\n",
+                wall, g.rate, gUframes, gNbuf, g.leadFrames,
+                A8DJ_UsbSafetyOffsetFrames(g.rate, 1), A8DJ_UsbSafetyOffsetFrames(g.rate, 0));
+        fflush(log);
+    }
+    CounterSnapshot prev = TakeSnapshot();
     while (g.running) {
         A8DJ_MidiInit();          // no-op once the ports exist
         PublishStatus();
         // Short naps so A8DJ_UsbStop, which joins this thread, is not held up
         // for the best part of a second inside StopIO.
         for (int i = 0; i < 20 && g.running; i++) usleep(50 * 1000);
+        MonitorTick(log, &prev);
+    }
+    if (log) {
+        fprintf(log, "=== 停止 t=%.0fs  resync IN=%u OUT=%u  クロック最大ずれ %ld µs  完了遅延最大 %d ms ===\n",
+                SessionSeconds(mach_absolute_time()), g.resyncsIn, g.resyncsOut,
+                g.clockErrMaxUs, g.cbLateMaxMs);
+        fclose(log);
     }
     return NULL;
 }
@@ -1150,7 +1618,8 @@ static void *StreamThread(void *arg)
     }
     g.running = 1;
     pthread_mutex_unlock(&g.startMutex);
-    PublishClock(0, mach_absolute_time(), 1);
+    g.sessionHost    = mach_absolute_time();
+    PublishClock(0, g.sessionHost, 1);
     g.outFrames      = 0;
     g.outBytePos     = OUT_START_PHASE;
     g.uframeCursor   = 0;
@@ -1238,13 +1707,19 @@ static void *PrepThread(void *arg)
 //   /Library/Preferences/com.sawada.audio8dj.conf
 //
 // Contents are one key per line:
-//   preset=safe | mid | low
+//   preset=safe | mid | low | fast
+//   (edits are picked up between sessions; see A8DJ_UsbReloadConfig)
 //   uframes=8|16|24|32     microframes per transfer
-//   nbuf=2|3|4             transfers in flight
+//   nbuf=2|3|4             transfers in flight (raised until >= 3 ms queued)
+//   in_margin_us=N         input slack beyond one transfer (default: one transfer)
+//   out_margin_us=N        output slack beyond lead + one transfer (default 0)
+//   hw_latency_in_us=N     converter/device latency reported to apps (default 0)
+//   hw_latency_out_us=N    same, output side; set from a loopback measurement
 //
-// Read at Initialize only, so the latency the plug-in reports to CoreAudio
-// always matches what the engine actually does. Changing it needs
-// `sudo killall coreaudiod` -- plugin/set-latency.sh does both.
+// Read at Initialize, and again whenever the file changes while no stream is
+// running (A8DJ_UsbReloadConfig), so the latency reported to CoreAudio always
+// matches what the engine does. A change made mid-stream applies once every
+// app has stopped using the device; no coreaudiod restart is needed.
 static void ApplyProfile(int uframes, int nbuf)
 {
     if (uframes >= 8 && uframes <= XFER_UFRAMES_MAX && (uframes % 8) == 0)
@@ -1253,27 +1728,112 @@ static void ApplyProfile(int uframes, int nbuf)
         gNbuf = nbuf;
 }
 
-static void LoadConfig(void)
+static int ClampUs(int us)
 {
-    static const char *paths[] = {
-        "/Users/Shared/audio8dj.conf",
-        "/Library/Preferences/com.sawada.audio8dj.conf",
-    };
-    for (size_t p = 0; p < sizeof(paths)/sizeof(paths[0]); p++) {
-        FILE *f = fopen(paths[p], "r");
-        if (!f) continue;
-        char line[128];
-        while (fgets(line, sizeof(line), f)) {
-            int v = 0;
-            if (strstr(line, "preset=safe"))      ApplyProfile(16, 4);
-            else if (strstr(line, "preset=mid"))  ApplyProfile(16, 3);
-            else if (strstr(line, "preset=low"))  ApplyProfile(8, 4);
-            else if (sscanf(line, " uframes = %d", &v) == 1) ApplyProfile(v, gNbuf);
-            else if (sscanf(line, " nbuf = %d", &v) == 1)    ApplyProfile(gUframes, v);
-        }
-        fclose(f);
+    return us < 0 ? 0 : us > 100000 ? 100000 : us;
+}
+
+static const char *const kConfigPaths[] = {
+    "/Users/Shared/audio8dj.conf",
+    "/Library/Preferences/com.sawada.audio8dj.conf",
+};
+
+// Identity of the config file last read, so an edit can be noticed.
+typedef struct {
+    int    which;          // index into kConfigPaths, -1 if none exists
+    dev_t  dev;
+    ino_t  ino;
+    off_t  size;
+    struct timespec mtime;
+} ConfigStamp;
+static ConfigStamp gConfigStamp = { -2, 0, 0, 0, {0, 0} };
+
+static ConfigStamp CurrentConfigStamp(void)
+{
+    ConfigStamp st = { -1, 0, 0, 0, {0, 0} };
+    for (size_t p = 0; p < sizeof(kConfigPaths) / sizeof(kConfigPaths[0]); p++) {
+        struct stat info;
+        if (stat(kConfigPaths[p], &info) != 0) continue;
+        st.which = (int)p;
+        st.dev = info.st_dev;
+        st.ino = info.st_ino;
+        st.size = info.st_size;
+        st.mtime = info.st_mtimespec;
         break;
     }
+    return st;
+}
+
+static int SameStamp(ConfigStamp a, ConfigStamp b)
+{
+    return a.which == b.which && a.dev == b.dev && a.ino == b.ino && a.size == b.size &&
+           a.mtime.tv_sec == b.mtime.tv_sec && a.mtime.tv_nsec == b.mtime.tv_nsec;
+}
+
+// Presets first, then individual keys, wherever they sit in the file:
+// set-latency.sh appends the preset line after any tuning keys.
+static void ApplyPreset(const char *line)
+{
+    if (strstr(line, "preset=safe"))       ApplyProfile(16, 4);
+    else if (strstr(line, "preset=mid"))   ApplyProfile(16, 3);
+    else if (strstr(line, "preset=low"))   ApplyProfile(8, 4);
+    // Measured on a loopback (48 kHz): 6.7 ms round trip at a 32-frame
+    // buffer, no dropouts in 5 minutes. 3 ms is the shortest queue that
+    // schedules at all, and 0.5 ms is the smallest input slack that held
+    // (0.25 ms left one frame to spare; 0 starved).
+    else if (strstr(line, "preset=fast")) { ApplyProfile(8, 3); gInMarginUs = 500; }
+}
+
+static void ApplyKey(const char *line)
+{
+    int v = 0;
+    if (sscanf(line, " uframes = %d", &v) == 1)                ApplyProfile(v, gNbuf);
+    else if (sscanf(line, " nbuf = %d", &v) == 1)              ApplyProfile(gUframes, v);
+    else if (sscanf(line, " in_margin_us = %d", &v) == 1)      gInMarginUs = ClampUs(v);
+    else if (sscanf(line, " out_margin_us = %d", &v) == 1)     gOutMarginUs = ClampUs(v);
+    else if (sscanf(line, " hw_latency_in_us = %d", &v) == 1)  gHwLatencyInUs = ClampUs(v);
+    else if (sscanf(line, " hw_latency_out_us = %d", &v) == 1) gHwLatencyOutUs = ClampUs(v);
+}
+
+static void LoadConfig(void)
+{
+    gUframes = 16; gNbuf = 4;
+    gInMarginUs = -1; gOutMarginUs = 0;
+    gHwLatencyInUs = gHwLatencyOutUs = 0;
+    gConfigStamp = CurrentConfigStamp();
+    if (gConfigStamp.which < 0) return;
+    FILE *f = fopen(kConfigPaths[gConfigStamp.which], "r");
+    if (!f) return;
+    char line[128];
+    for (int pass = 0; pass < 2; pass++) {
+        if (fseek(f, 0, SEEK_SET) != 0) break;
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '#') continue;
+            if (pass == 0) ApplyPreset(line);
+            else ApplyKey(line);
+        }
+    }
+    fclose(f);
+    // Measured on this hardware: with less than about 3 ms queued, the next
+    // transfer's frame has already passed by the time the previous one
+    // completes, so every single submission is rescheduled (8x2 = 2 ms:
+    // 12,000 resyncs a minute). Keep the queue at or above 3 ms.
+    while (gNbuf * gUframes < 24 && gNbuf < NBUF_MAX) gNbuf++;
+}
+
+// Re-read the config if it changed, but only between sessions: the engine's
+// geometry and the offsets CoreAudio was told must never disagree mid-stream.
+// Returns nonzero when anything CoreAudio sees (offsets, latency) changed.
+// Called from the HAL presence worker, serialized with Start/Stop.
+int A8DJ_UsbReloadConfig(void)
+{
+    if (!g.inited || g.threadValid || g.running) return 0;
+    if (SameStamp(CurrentConfigStamp(), gConfigStamp)) return 0;
+    int u = gUframes, n = gNbuf, im = gInMarginUs, om = gOutMarginUs;
+    int hi = gHwLatencyInUs, ho = gHwLatencyOutUs;
+    LoadConfig();
+    return u != gUframes || n != gNbuf || im != gInMarginUs || om != gOutMarginUs ||
+           hi != gHwLatencyInUs || ho != gHwLatencyOutUs;
 }
 
 void A8DJ_UsbPrepare(void)
@@ -1302,8 +1862,8 @@ void A8DJ_UsbPrepare(void)
             g.outBuf[i]  = calloc(XFER_UFRAMES_MAX, ISO_MAXPKT);
             g.inList[i]  = calloc(XFER_UFRAMES_MAX, sizeof(IOUSBIsocFrame));
             g.outList[i] = calloc(XFER_UFRAMES_MAX, sizeof(IOUSBIsocFrame));
-            g.inRef[i]   = (XferRef){ i, 1, 0 };
-            g.outRef[i]  = (XferRef){ i, 0, 0 };
+            g.inRef[i]   = (XferRef){ .idx = i, .isInput = 1 };
+            g.outRef[i]  = (XferRef){ .idx = i, .isInput = 0 };
         }
         g.buffersReady = g.capture && g.playback && g.captureSlots && g.playbackSlots;
         for (int i = 0; i < NBUF_MAX; i++)
@@ -1350,6 +1910,12 @@ static void ResetSession(void)
     g.frErrIn        = g.frErrOut = 0;
     g.shortIn        = g.inGap = 0;
     g.outStarve      = 0;
+    g.outIdleEvents  = 0;
+    g.outIdle        = 0;
+    g.outIdleStart   = 0;
+    g.starveRun      = 0;
+    g.starveRunMin   = 0;
+    g.lastWriteFrames = 0;
     g.startStarve    = 0;
     g.outMarginMin   = 1L << 30;
     g.inStarve       = 0;
@@ -1357,6 +1923,20 @@ static void ResetSession(void)
     g.driftAvg       = 0.0;
     g.driftPrimed    = 0;
     g.driftFix       = 0;
+    g.inLostFrames   = 0;
+    g.pendingInGapUframes = g.pendingOutGapUframes = 0;
+    g.inLossCarry    = 0.0;
+    g.dllPrimed      = 0;
+    g.clockErrMaxUs  = 0;
+    g.clockResets    = 0;
+    g.resyncsIn = g.resyncsOut = 0;
+    g.clockErrWinUs  = 0;
+    g.cbLateWinMs = g.cbLateMaxMs = 0;
+    g.inMarginWin = g.outMarginWin = 1L << 30;
+    g.sessionHost = g.lastSpikeHost = 0;
+    g.evHead = 0;
+    g.evTail = 0;
+    for (int i = 0; i < NBUF_MAX; i++) g.inRef[i].gapUframes = 0;
 }
 
 int A8DJ_UsbStart(double inRate)
@@ -1484,15 +2064,22 @@ void A8DJ_UsbReadCapture(Float32 *outBuf, uint64_t inStartFrame, uint32_t inFram
     uint64_t generation = g.clockSeed;
     uint64_t have = g.deviceFrames;
     if (have > (uint64_t)g.rate) {
-        // Saturate diagnostics rather than overflowing signed arithmetic.
-        long margin = have >= inStartFrame && have - inStartFrame <= LONG_MAX
-            ? (long)(have - inStartFrame) - (long)inFrames : -LONG_MAX;
+        // Signed distance in both directions: a read that starts past `have`
+        // is a shortfall of exactly that many frames, not "infinitely short".
+        // FrameDistance saturates at +-INT64_MAX, so only the subtraction can
+        // still overflow.
+        int64_t ahead = FrameDistance(have, inStartFrame);
+        long margin = ahead < -INT64_MAX + (int64_t)inFrames
+            ? -LONG_MAX : (long)(ahead - (int64_t)inFrames);
         if (margin < g.inMarginMin) g.inMarginMin = margin;
+        AtomicMinLong(&g.inMarginWin, margin);
         if (margin < 0) g.inStarve++;
     }
+    // Frames past `have` have not arrived. Their slots still hold the previous
+    // lap, whose tags do not match, so they read as silence -- not as a copy
+    // of the newest frame, which turned a late read into a stair-step.
     for (uint32_t f = 0; f < inFrames; f++) {
         uint64_t frame = inStartFrame + f;
-        if (have && frame >= have) frame = have - 1;
         size_t slot = (size_t)(frame & RING_MASK);
         A8DJ_RingRead(g.capture + slot * A8DJ_CHANNELS, &g.captureSlots[slot],
                      frame, generation, outBuf + (size_t)f * A8DJ_CHANNELS, A8DJ_CHANNELS);
@@ -1511,6 +2098,7 @@ void A8DJ_UsbWritePlayback(const Float32 *inBuf, uint64_t inStartFrame, uint32_t
                       frame, generation, inBuf + (size_t)f * A8DJ_CHANNELS, A8DJ_CHANNELS);
     }
     // Publish the watermark only after all stores, never before filling data.
+    g.lastWriteFrames = inFrames;
     g.lastWriteFrame = inStartFrame;
     g.lastWriteEnd = inStartFrame + inFrames;
 }

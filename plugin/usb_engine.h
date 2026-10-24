@@ -25,6 +25,11 @@ void A8DJ_UsbPrepare(void);
 // Call off the audio thread, serialized with Prepare/Start/Stop.
 uint64_t A8DJ_UsbPollDevice(void);
 
+// Re-reads the latency config if the file changed. Only acts while no
+// session exists; nonzero means latency/safety offsets changed and CoreAudio
+// should be told. Same serialization as A8DJ_UsbPollDevice.
+int  A8DJ_UsbReloadConfig(void);
+
 int  A8DJ_UsbStart(double inRate);
 void A8DJ_UsbStop(void);
 
@@ -42,6 +47,13 @@ void A8DJ_UsbWritePlayback(const Float32 *inBuf, uint64_t inStartFrame, uint32_t
 // both or it writes and reads the wrong part of the ring.
 uint32_t A8DJ_UsbOutputLeadFrames(double inRate);
 uint32_t A8DJ_UsbTransferFrames(double inRate);
+
+// kAudioDevicePropertySafetyOffset: how close to "now" CoreAudio may read
+// (input) or write (output). Includes the queue lead and configured margins.
+uint32_t A8DJ_UsbSafetyOffsetFrames(double inRate, int isInput);
+// kAudioDevicePropertyLatency: delay outside the published timeline
+// (converters, device FIFO). Never includes the queue lead.
+uint32_t A8DJ_UsbDeviceLatencyFrames(double inRate, int isInput);
 
 // Short human-readable state, surfaced through the device name while bringing
 // the driver up.

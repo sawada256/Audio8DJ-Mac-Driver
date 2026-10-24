@@ -5,7 +5,7 @@
 
 all: test
 
-pack_test: pack_test.c
+pack_test: pack_test.c ../plugin/sample_convert.h
 	$(CC) -O2 -Wall -Wextra -o $@ pack_test.c
 
 midi_test: midi_test.c ../plugin/midi_parser_inc.h
@@ -14,7 +14,7 @@ midi_test: midi_test.c ../plugin/midi_parser_inc.h
 lifecycle_test: lifecycle_test.c ../plugin/Audio8DJ.c ../plugin/usb_engine.h
 	$(CC) -O2 -Wall -Wextra -Werror -framework CoreAudio -framework CoreFoundation -o $@ lifecycle_test.c
 
-usb_lifecycle_test: ../firmware/audio8dj_firmware.h usb_lifecycle_test.c ../plugin/usb_engine.c ../plugin/midi.c ../plugin/audio_ring.h ../plugin/midi_fifo.h ../plugin/status_file.h
+usb_lifecycle_test: ../firmware/audio8dj_firmware.h usb_lifecycle_test.c ../plugin/usb_engine.c ../plugin/sample_convert.h ../plugin/midi.c ../plugin/audio_ring.h ../plugin/midi_fifo.h ../plugin/status_file.h
 	$(CC) -O2 -Wall -Wextra -Werror -framework CoreAudio -framework CoreFoundation -framework IOKit -o $@ usb_lifecycle_test.c ../plugin/midi.c
 
 audio_ring_test: audio_ring_test.c ../plugin/audio_ring.h
