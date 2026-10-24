@@ -36,6 +36,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 #include "../firmware/audio8dj_firmware.h"
 
@@ -925,7 +926,10 @@ static uint64_t ClockObserve(uint64_t pos, double t)
         AtomicMaxLong(&g.clockErrWinUs, (long)errUs);
         // Signed: positive means the frames completed later than the line.
         uint64_t now = mach_absolute_time();
-        if (errUs > 500.0 && now - g.lastSpikeHost > (uint64_t)(TicksPerSecond() / 10)) {
+        // The bus frame read is quantized to 1 ms (measured: the microframe
+        // call returns frame * 8 on this controller), so up to ~1 ms of
+        // scatter is normal. Only report what goes beyond it.
+        if (errUs > 1500.0 && now - g.lastSpikeHost > (uint64_t)(TicksPerSecond() / 10)) {
             g.lastSpikeHost = now;
             PushEvent(EV_CLOCK_SPIKE, (int)(e / ticksPerUs), (int)(pos % 1000000000), now);
         }
@@ -1703,17 +1707,19 @@ static void *PrepThread(void *arg)
 //   /Library/Preferences/com.sawada.audio8dj.conf
 //
 // Contents are one key per line:
-//   preset=safe | mid | low
+//   preset=safe | mid | low | fast
+//   (edits are picked up between sessions; see A8DJ_UsbReloadConfig)
 //   uframes=8|16|24|32     microframes per transfer
-//   nbuf=2|3|4             transfers in flight
+//   nbuf=2|3|4             transfers in flight (raised until >= 3 ms queued)
 //   in_margin_us=N         input slack beyond one transfer (default: one transfer)
 //   out_margin_us=N        output slack beyond lead + one transfer (default 0)
 //   hw_latency_in_us=N     converter/device latency reported to apps (default 0)
 //   hw_latency_out_us=N    same, output side; set from a loopback measurement
 //
-// Read at Initialize only, so the latency the plug-in reports to CoreAudio
-// always matches what the engine actually does. Changing it needs
-// `sudo killall coreaudiod` -- plugin/set-latency.sh does both.
+// Read at Initialize, and again whenever the file changes while no stream is
+// running (A8DJ_UsbReloadConfig), so the latency reported to CoreAudio always
+// matches what the engine does. A change made mid-stream applies once every
+// app has stopped using the device; no coreaudiod restart is needed.
 static void ApplyProfile(int uframes, int nbuf)
 {
     if (uframes >= 8 && uframes <= XFER_UFRAMES_MAX && (uframes % 8) == 0)
@@ -1727,31 +1733,107 @@ static int ClampUs(int us)
     return us < 0 ? 0 : us > 100000 ? 100000 : us;
 }
 
-static void LoadConfig(void)
+static const char *const kConfigPaths[] = {
+    "/Users/Shared/audio8dj.conf",
+    "/Library/Preferences/com.sawada.audio8dj.conf",
+};
+
+// Identity of the config file last read, so an edit can be noticed.
+typedef struct {
+    int    which;          // index into kConfigPaths, -1 if none exists
+    dev_t  dev;
+    ino_t  ino;
+    off_t  size;
+    struct timespec mtime;
+} ConfigStamp;
+static ConfigStamp gConfigStamp = { -2, 0, 0, 0, {0, 0} };
+
+static ConfigStamp CurrentConfigStamp(void)
 {
-    static const char *paths[] = {
-        "/Users/Shared/audio8dj.conf",
-        "/Library/Preferences/com.sawada.audio8dj.conf",
-    };
-    for (size_t p = 0; p < sizeof(paths)/sizeof(paths[0]); p++) {
-        FILE *f = fopen(paths[p], "r");
-        if (!f) continue;
-        char line[128];
-        while (fgets(line, sizeof(line), f)) {
-            int v = 0;
-            if (strstr(line, "preset=safe"))      ApplyProfile(16, 4);
-            else if (strstr(line, "preset=mid"))  ApplyProfile(16, 3);
-            else if (strstr(line, "preset=low"))  ApplyProfile(8, 4);
-            else if (sscanf(line, " uframes = %d", &v) == 1) ApplyProfile(v, gNbuf);
-            else if (sscanf(line, " nbuf = %d", &v) == 1)    ApplyProfile(gUframes, v);
-            else if (sscanf(line, " in_margin_us = %d", &v) == 1)      gInMarginUs = ClampUs(v);
-            else if (sscanf(line, " out_margin_us = %d", &v) == 1)     gOutMarginUs = ClampUs(v);
-            else if (sscanf(line, " hw_latency_in_us = %d", &v) == 1)  gHwLatencyInUs = ClampUs(v);
-            else if (sscanf(line, " hw_latency_out_us = %d", &v) == 1) gHwLatencyOutUs = ClampUs(v);
-        }
-        fclose(f);
+    ConfigStamp st = { -1, 0, 0, 0, {0, 0} };
+    for (size_t p = 0; p < sizeof(kConfigPaths) / sizeof(kConfigPaths[0]); p++) {
+        struct stat info;
+        if (stat(kConfigPaths[p], &info) != 0) continue;
+        st.which = (int)p;
+        st.dev = info.st_dev;
+        st.ino = info.st_ino;
+        st.size = info.st_size;
+        st.mtime = info.st_mtimespec;
         break;
     }
+    return st;
+}
+
+static int SameStamp(ConfigStamp a, ConfigStamp b)
+{
+    return a.which == b.which && a.dev == b.dev && a.ino == b.ino && a.size == b.size &&
+           a.mtime.tv_sec == b.mtime.tv_sec && a.mtime.tv_nsec == b.mtime.tv_nsec;
+}
+
+// Presets first, then individual keys, wherever they sit in the file:
+// set-latency.sh appends the preset line after any tuning keys.
+static void ApplyPreset(const char *line)
+{
+    if (strstr(line, "preset=safe"))       ApplyProfile(16, 4);
+    else if (strstr(line, "preset=mid"))   ApplyProfile(16, 3);
+    else if (strstr(line, "preset=low"))   ApplyProfile(8, 4);
+    // Measured on a loopback (48 kHz): 6.7 ms round trip at a 32-frame
+    // buffer, no dropouts in 5 minutes. 3 ms is the shortest queue that
+    // schedules at all, and 0.5 ms is the smallest input slack that held
+    // (0.25 ms left one frame to spare; 0 starved).
+    else if (strstr(line, "preset=fast")) { ApplyProfile(8, 3); gInMarginUs = 500; }
+}
+
+static void ApplyKey(const char *line)
+{
+    int v = 0;
+    if (sscanf(line, " uframes = %d", &v) == 1)                ApplyProfile(v, gNbuf);
+    else if (sscanf(line, " nbuf = %d", &v) == 1)              ApplyProfile(gUframes, v);
+    else if (sscanf(line, " in_margin_us = %d", &v) == 1)      gInMarginUs = ClampUs(v);
+    else if (sscanf(line, " out_margin_us = %d", &v) == 1)     gOutMarginUs = ClampUs(v);
+    else if (sscanf(line, " hw_latency_in_us = %d", &v) == 1)  gHwLatencyInUs = ClampUs(v);
+    else if (sscanf(line, " hw_latency_out_us = %d", &v) == 1) gHwLatencyOutUs = ClampUs(v);
+}
+
+static void LoadConfig(void)
+{
+    gUframes = 16; gNbuf = 4;
+    gInMarginUs = -1; gOutMarginUs = 0;
+    gHwLatencyInUs = gHwLatencyOutUs = 0;
+    gConfigStamp = CurrentConfigStamp();
+    if (gConfigStamp.which < 0) return;
+    FILE *f = fopen(kConfigPaths[gConfigStamp.which], "r");
+    if (!f) return;
+    char line[128];
+    for (int pass = 0; pass < 2; pass++) {
+        if (fseek(f, 0, SEEK_SET) != 0) break;
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '#') continue;
+            if (pass == 0) ApplyPreset(line);
+            else ApplyKey(line);
+        }
+    }
+    fclose(f);
+    // Measured on this hardware: with less than about 3 ms queued, the next
+    // transfer's frame has already passed by the time the previous one
+    // completes, so every single submission is rescheduled (8x2 = 2 ms:
+    // 12,000 resyncs a minute). Keep the queue at or above 3 ms.
+    while (gNbuf * gUframes < 24 && gNbuf < NBUF_MAX) gNbuf++;
+}
+
+// Re-read the config if it changed, but only between sessions: the engine's
+// geometry and the offsets CoreAudio was told must never disagree mid-stream.
+// Returns nonzero when anything CoreAudio sees (offsets, latency) changed.
+// Called from the HAL presence worker, serialized with Start/Stop.
+int A8DJ_UsbReloadConfig(void)
+{
+    if (!g.inited || g.threadValid || g.running) return 0;
+    if (SameStamp(CurrentConfigStamp(), gConfigStamp)) return 0;
+    int u = gUframes, n = gNbuf, im = gInMarginUs, om = gOutMarginUs;
+    int hi = gHwLatencyInUs, ho = gHwLatencyOutUs;
+    LoadConfig();
+    return u != gUframes || n != gNbuf || im != gInMarginUs || om != gOutMarginUs ||
+           hi != gHwLatencyInUs || ho != gHwLatencyOutUs;
 }
 
 void A8DJ_UsbPrepare(void)

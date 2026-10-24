@@ -25,6 +25,11 @@ void A8DJ_UsbPrepare(void);
 // Call off the audio thread, serialized with Prepare/Start/Stop.
 uint64_t A8DJ_UsbPollDevice(void);
 
+// Re-reads the latency config if the file changed. Only acts while no
+// session exists; nonzero means latency/safety offsets changed and CoreAudio
+// should be told. Same serialization as A8DJ_UsbPollDevice.
+int  A8DJ_UsbReloadConfig(void);
+
 int  A8DJ_UsbStart(double inRate);
 void A8DJ_UsbStop(void);
 

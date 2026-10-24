@@ -37,9 +37,25 @@ The per-user MIDI agent creates CoreMIDI ports and exchanges bytes with the HAL 
 
 ## レイテンシ / Latency
 
-`bash scripts/set-latency.sh safe`（標準）, `mid`, `low`。設定は `/Users/Shared/audio8dj.conf` に保存され、反映時に音声が中断します。`safe` から始め、USB負荷に応じて調整してください。DAWのバッファ設定は別項目です。
+`bash scripts/set-latency.sh safe`（標準）, `mid`, `low`, `fast`。設定は `/Users/Shared/audio8dj.conf` に保存され、Audio 8 DJ を使うアプリがすべて止まった時点でドライバーが読み直します（coreaudiod の再起動は不要。`--restart` で強制再起動）。`safe` から始め、USB負荷に応じて調整してください。DAWのバッファ設定は別項目です。
 
-Use `bash scripts/set-latency.sh safe` (default), `mid`, or `low`. The profile is stored in `/Users/Shared/audio8dj.conf`; applying it interrupts audio. Start with safe and adjust for USB load. The DAW's buffer size is a separate setting.
+Use `bash scripts/set-latency.sh safe` (default), `mid`, `low` or `fast`. The profile is stored in `/Users/Shared/audio8dj.conf` and the driver re-reads it once no app is using the device (no coreaudiod restart; `--restart` forces one). Start with safe and adjust for USB load. The DAW's buffer size is a separate setting.
+
+| プロファイル / Profile | 転送 / Transfers | セーフティ in/out (48 kHz) | 往復遅延 実測 / Measured round trip |
+|---|---|---|---|
+| safe | 2 ms × 4 | 192 / 480 | 約 16 ms (バッファ64, 計算値) |
+| low | 1 ms × 4 | 96 / 240 | 8.2 ms (バッファ32) / 7.5 ms (16) |
+| fast | 1 ms × 3, 入力余裕 0.5 ms | 72 / 192 | 6.7 ms (バッファ32) / 6.0 ms (16) |
+
+実測は出力 7/8（ヘッドホン端子）→入力 7/8 のループバック。fast は5分間、44.1 / 48 / 96 kHz で音切れなし（96 kHz・バッファ32で 5.8 ms）。1 ms × 2 はスケジュールが毎回間に合わず成立しないため、ドライバーはキューを 3 ms 以上に保ちます。入力余裕 0.25 ms では最小余裕が1フレームまで減り、0 では録音の先読み不足が起きました。
+
+Measured through an out 7/8 (headphone jack) to in 7/8 loopback. fast ran 5 minutes, and at 44.1 / 48 / 96 kHz, without a dropout (5.8 ms at 96 kHz, buffer 32). 1 ms × 2 never schedules in time, so the driver keeps at least 3 ms queued. 0.25 ms of input slack left one frame to spare; 0 starved.
+
+### ループバック測定 / Loopback measurement
+
+`build/bin/a8dj-loopback --out 7 --in 7 --buffer 32 --seconds 30 [--rate 96000]` は出力ペアから試験信号を出し、入力ペアで受けて、往復遅延（ハードウェア経路とアプリから見た値）、1 ms 単位の音切れ、周波数特性（1 kHz 基準・コヒーレンス付き）を表示します。ケーブルで出力と入力をつないでから実行してください。
+
+`build/bin/a8dj-loopback` plays a test signal on an output pair, records an input pair, and reports round-trip latency (hardware path and as seen by an app), 1 ms dropout detection and frequency response relative to 1 kHz with coherence. Connect the output to the input with a cable first.
 
 ### 詳細設定 / Fine tuning
 

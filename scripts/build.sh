@@ -3,10 +3,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 sh plugin/build.sh
 mkdir -p build/bin
-for name in a8dj-midid a8dj-audio; do
+for name in a8dj-midid a8dj-audio a8dj-loopback; do
     case "$name" in
         a8dj-midid) frameworks=(-framework CoreMIDI -framework CoreFoundation) ;;
         a8dj-audio) frameworks=(-framework CoreAudio -framework CoreFoundation) ;;
+        a8dj-loopback) frameworks=(-framework CoreAudio -framework CoreFoundation -framework Accelerate) ;;
         a8dj) frameworks=(-framework IOKit -framework CoreFoundation) ;;
     esac
     clang -O2 -Wall -Wextra -Wno-deprecated-declarations \

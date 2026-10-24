@@ -11,7 +11,9 @@ static UInt64 requestedRate;
 static int clockAvailable;
 static uint64_t clockFrames, clockHost, clockSeed;
 static int captures, playbacks;
-static int restartAllowed; // a rate change restarts USB under running clients
+static int restartAllowed;
+static int timingChanges;
+static void Flush(void *u) { (void)u; } // a rate change restarts USB under running clients
 static UInt32 Scalar(AudioObjectID object, AudioObjectPropertySelector selector)
 {
     AudioObjectPropertyAddress a = { selector, kAudioObjectPropertyScopeGlobal, 0 };
@@ -33,20 +35,27 @@ static OSStatus Changed(AudioServerPlugInHostRef host, AudioObjectID object,
         pthread_mutex_unlock(&gIOMutex);
         assert(count == 2);
         listChanges++;
+    } else if (addresses[0].mSelector == kAudioDevicePropertyLatency) {
+        assert(count == 4 && addresses[2].mSelector == kAudioDevicePropertySafetyOffset);
+        timingChanges++;
     } else if (addresses[0].mSelector == kAudioDevicePropertyDeviceIsAlive) {
         assert(Scalar(kObjectID_Device, kAudioDevicePropertyDeviceIsAlive) == 0);
         deadChanges++;
     }
     return 0;
 }
+static int timingRequests;
 static OSStatus Request(AudioServerPlugInHostRef h, AudioObjectID o, UInt64 action, void *info)
 {
     (void)h; (void)o; (void)info;
+    if (action == 1) { timingRequests++; return 0; }
     requestedRate = action;
     return requestResult;
 }
 void A8DJ_UsbPrepare(void) {}
 uint64_t A8DJ_UsbPollDevice(void) { return deviceID; }
+static int configChanged, reloads;
+int A8DJ_UsbReloadConfig(void) { reloads++; int c = configChanged; configChanged = 0; return c; }
 int A8DJ_UsbStart(double rate) { (void)rate; starts++; return startFailure; }
 void A8DJ_UsbStop(void)
 {
@@ -268,6 +277,24 @@ int main(void)
                                    sizeof(Float64), unaligned + 1) == kAudioHardwareUnknownPropertyError);
     property.mElement = 0; property.mScope = kAudioObjectPropertyScopeInput;
     assert(!Audio8DJ_HasProperty(gDriverRef, kObjectID_Device, 0, &property));
+    // Latency config edits apply between sessions only, and tell the host.
+    gNotifyQueue = dispatch_queue_create("test", DISPATCH_QUEUE_SERIAL);
+    UInt32 savedRunning = gIORunningCount;
+    gIORunningCount = 1; configChanged = 1;
+    int reloadsBefore = reloads;
+    RefreshPresence();
+    assert(reloads == reloadsBefore && configChanged == 1);
+    gIORunningCount = 0;
+    RefreshPresence();
+    dispatch_sync_f(gNotifyQueue, NULL, Flush);
+    assert(reloads == reloadsBefore + 1 && timingRequests == 1);
+    RefreshPresence();                              // unchanged file: no notification
+    dispatch_sync_f(gNotifyQueue, NULL, Flush);
+    assert(timingRequests == 1 && timingChanges == 1);
+    Float64 rateBefore = gSampleRate;
+    assert(Audio8DJ_PerformDeviceConfigurationChange(gDriverRef, kObjectID_Device, 1, NULL) == 0);
+    assert(gSampleRate == rateBefore);
+    gIORunningCount = savedRunning;
     TestClockAndIO();
-    puts("PASS: presence, UID, notifications, replug, clients, start failure, rate, 1000 switches, clock jitter and IO validation");
+    puts("PASS: presence, UID, notifications, replug, clients, start failure, rate, 1000 switches, config reload, clock jitter and IO validation");
 }

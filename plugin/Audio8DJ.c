@@ -109,9 +109,35 @@ static void NotifyPresence(void)
     }
 }
 
+// Configuration-change action meaning "latency/safety offsets changed".
+// Sample rates are the other actions; no supported rate can be 1.
+#define kChangeActionTiming 1
+
+// The latency config changed between sessions. coreaudiod caches the safety
+// offsets: measured, a plain PropertiesChanged left it on the old values
+// while the engine ran with the new ones. A configuration change makes the
+// host re-read the device, which is how it is meant to learn of this.
+static void RequestTimingChange(void *unused)
+{
+    (void)unused;
+    if (!gHost) return;
+    gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, kChangeActionTiming, NULL);
+    AudioObjectPropertyAddress a[4] = {
+        { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain },
+    };
+    gHost->PropertiesChanged(gHost, kObjectID_Device, 4, a);
+}
+
 static void RefreshPresence(void)
 {
     pthread_mutex_lock(&gIOMutex);
+    if (gIORunningCount == 0 && A8DJ_UsbReloadConfig()) {
+        os_log(OS_LOG_DEFAULT, "Audio8DJ: latency config reloaded");
+        if (gNotifyQueue) dispatch_async_f(gNotifyQueue, NULL, RequestTimingChange);
+    }
     uint64_t identity = A8DJ_UsbPollDevice();
     if (identity == gRegistryID) { pthread_mutex_unlock(&gIOMutex); return; }
     if (gRegistryID) {
@@ -367,6 +393,10 @@ static OSStatus Audio8DJ_PerformDeviceConfigurationChange(AudioServerPlugInDrive
     (void)inChangeInfo;
     if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
     if (inDeviceObjectID != kObjectID_Device) return kAudioHardwareBadObjectError;
+
+    // Nothing to do here: the values are already current, and the host
+    // re-reads them once this returns.
+    if (inChangeAction == kChangeActionTiming) return kAudioHardwareNoError;
 
     // inChangeAction carries the requested sample rate, set by SetPropertyData.
     Float64 newRate = (Float64)inChangeAction;
