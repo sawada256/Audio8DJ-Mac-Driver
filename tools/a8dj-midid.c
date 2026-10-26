@@ -6,6 +6,7 @@
 #include "midi_queue.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
+#include <mach/mach_time.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -29,6 +30,8 @@ static unsigned long gInBytes;
 static _Atomic unsigned long gOutBytes;
 static _Atomic unsigned long gDroppedPackets;
 static A8DJ_MidiQueue gOutputQueue = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+// Host time at which the bytes being parsed were read from the FIFO.
+static MIDITimeStamp gStamp;
 static int gWake[2] = {-1, -1};
 
 // ---------------------------------------------------------------- parser
@@ -38,7 +41,13 @@ static void Emit(const uint8_t *bytes, int n)
     union { max_align_t alignment; Byte bytes[4096 + 64]; } storage;
     MIDIPacketList *list = (MIDIPacketList *)storage.bytes;
     MIDIPacket *pkt = MIDIPacketListInit(list);
-    pkt = MIDIPacketListAdd(list, sizeof(storage), pkt, 0, (ByteCount)n, bytes);
+    // A real host time, never 0. MIDISend treats 0 as "now", but a source's
+    // MIDIReceived passes the value through to every client untouched, and
+    // DAWs place a recorded event by it: Cubase put every note of a take at
+    // the same instant (the start), and notes still held at stop became long
+    // notes up to the stop point.
+    pkt = MIDIPacketListAdd(list, sizeof(storage), pkt, gStamp ? gStamp : mach_absolute_time(),
+                            (ByteCount)n, bytes);
     if (pkt) MIDIReceived(gSource, list);
     if (gVerbose) {
         printf("  -> host :");
@@ -153,6 +162,7 @@ int main(int argc, char **argv)
         ssize_t n = read(gToHostFd, buf, sizeof(buf));
         if (n > 0) {
             gInBytes += (unsigned long)n;
+            gStamp = mach_absolute_time();
             ParseBytes(buf, (int)n);
         } else if (n < 0 && errno != EAGAIN && errno != EINTR) break;
     }
