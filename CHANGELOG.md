@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- MIDI IN のタイムスタンプが常に 0 だった問題を修正。Cubase でリアルタイム録音すると全ノートが録音開始位置に集まり、押したままのノートが録音停止までの長いノートになっていました。受信時刻（ホスト時刻）を付けて送ります。
+- MIDI IN timestamps were always 0, so Cubase placed every recorded note at the start of the take (held notes became long notes up to the stop). Packets now carry the host time they were received.
 - 出力レイテンシの報告で USB キューの lead を二重に数えていた問題を修正。機器側レイテンシは設定キー `hw_latency_in_us` / `hw_latency_out_us` で報告します。
 - IN パケットの欠落・再スケジュール時に公開クロックが実時間から遅れ、ドリフト補正が機器の出力 FIFO を枯渇させていた問題を修正。欠落区間は時間を進めて無音にします。OUT 側も再スケジュール分を読み飛ばして整列を保ちます。
 - クロックを USB バスフレーム時刻と DLL（遅延ロックループ）で平滑化し、コールバックの揺らぎが zero timestamp に乗らないようにしました。
